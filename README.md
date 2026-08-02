@@ -19,6 +19,8 @@ The attack flow is as follows:
 
 Both user and computer accounts can be targeted.
 
+![image](Assets/Attack_flow.png)
+
 ## Requirements
 
 - Windows with PowerShell.
@@ -27,8 +29,7 @@ Both user and computer accounts can be targeted.
   Place it in the current directory, or point to it with `-RubeusPath`.
 - Either:
   - A domain account you control and can write a UPN to.
-  - Permission
-  to create accounts in an OU/Container (specified with `-CreateNewPath`).
+  - Permission to create accounts in an OU/Container (specified with `-CreateNewPath`).
 - An unpatched DC to target. Can be specified with `-DC`.
 
 ## Usage
