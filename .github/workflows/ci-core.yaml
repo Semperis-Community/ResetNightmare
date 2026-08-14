@@ -1,0 +1,38 @@
+name: CI
+
+run-name: CI | ${{ github.ref_name }} | Central Wrapper
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - closed
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  ci-core:
+    if: ${{ vars.PIPELINE_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.action != 'closed' || github.event.pull_request.merged == true) }}
+    uses: Semperis-Community/.github/.github/workflows/ci-core-reusable.yaml@v1.0.0
+    with:
+      checkout_ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.merge_commit_sha || github.sha }}
+      pkg_dependency_reference_file: pipeline-config/ref/pkg-dependencies.yaml
+      test_dependency_reference_file: pipeline-config/ref/test-dependencies.yaml
+      pipeline_config_file: pipeline-config/ref/pipeline.yaml
+      publish_targets_file: pipeline-config/ref/publish-targets.yaml
+      release_stage_config_file: pipeline-config/ref/release-stages.yaml
+      release_package_exclusions_file: pipeline-config/ref/release-package-exclusions.yaml
+      notify_config_file: pipeline-config/ref/notify.yaml
+      incident_config_file: pipeline-config/ref/incidents.yaml
+      workflow_contract_version: 1.0.0
+    secrets: inherit

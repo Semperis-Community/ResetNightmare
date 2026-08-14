@@ -1,0 +1,31 @@
+# Example dependency reference file for the repository named provisioning.
+# powershellRepositories identifies release-backed repositories whose latest assets are staged into the package.
+# This sample treats upstream dependencies as release-backed repos rather than package feeds.
+#
+# Version fields:
+#   Omit 'version' or set it to "latest" to always stage the newest available release assets.
+#   Set 'version' to a specific SemVer string (e.g. "5.6.1") to pin to that exact release.
+
+powershellRepositories: []
+
+# PowerShell modules to stage in release packaging.
+# When present, this list defines the release packages to download and include in the archive.
+powershellModules: []
+
+# .NET release package sources and package list.
+# dotnetReleaseRepositories identifies repos whose latest release assets are staged into the package.
+# dotnetReleasePackages lists the packages to include in the archive.
+# Version fields:
+#   Omit 'version' or set it to "latest" to always stage the newest available release assets.
+#   Set 'version' to a specific SemVer string (e.g. "5.6.1") to pin to that exact release.
+dotnetReleaseRepositories: []
+dotnetReleasePackages: []
+
+# Python release package sources and package list.
+# pythonReleaseRepositories identifies repos whose latest release assets are staged into the package.
+# pythonReleasePackages lists the packages to include in the archive.
+# Version fields:
+#   Omit 'version' or set it to "latest" to always stage the newest available release assets.
+#   Set 'version' to a specific SemVer string (e.g. "1.2.0") to pin to that exact release.
+pythonReleaseRepositories: []
+pythonReleasePackages: []

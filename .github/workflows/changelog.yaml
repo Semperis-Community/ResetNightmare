@@ -1,0 +1,20 @@
+name: Changelog
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  changelog:
+    if: ${{ vars.PIPELINE_ENABLED == 'true' }}
+    uses: Semperis-Community/.github/.github/workflows/changelog-reusable.yaml@v1.0.0
+    with:
+      target_branch: ${{ github.ref_name }}
+      changelog_file: CHANGELOG.md
+      notify_config_file: pipeline-config/ref/notify.yaml
+      incident_config_file: pipeline-config/ref/incidents.yaml
+      workflow_contract_version: 1.0.0
+    secrets: inherit

@@ -1,0 +1,22 @@
+name: CI PowerShell Wrapper
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to check out.
+        type: string
+        required: true
+      dependency-file:
+        description: Path to the dependency reference file.
+        type: string
+        default: pipeline-config/ref/test-dependencies.yaml
+
+jobs:
+  ci-powershell:
+    if: ${{ vars.PIPELINE_ENABLED == 'true' }}
+    uses: Semperis-Community/.github/.github/workflows/ci-powershell-reusable.yaml@v1.0.0
+    with:
+      ref: ${{ inputs.ref }}
+      dependency-file: ${{ inputs['dependency-file'] }}
+    secrets: inherit

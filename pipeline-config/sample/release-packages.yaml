@@ -1,0 +1,21 @@
+# Optional multi-package release configuration.
+# If releasePackages is omitted or empty, the workflow falls back to
+# pipeline-config/ref/pipeline.yaml releasePackageName and creates one archive.
+
+configVersion: 1.0.0
+
+# When true, the same file can be included in multiple packages.
+# When false, overlapping file ownership fails release packaging.
+allowPathOverlaps: false
+
+# When enabled, include the default single-package output in addition to
+# any entries defined under releasePackages.
+singlePackage:
+  enabled: false
+  releasePackageName: ResetNightmare
+
+# Optional multi-package output definitions.
+# includePaths/excludePaths entries are repository-relative paths.
+# includePaths is required and must contain at least one path.
+# excludePaths is required and can be an empty list.
+releasePackages: []

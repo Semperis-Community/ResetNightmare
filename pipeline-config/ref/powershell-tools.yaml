@@ -1,0 +1,10 @@
+# PowerShell tool setup used by release workflow setup-powershell-tools action.
+# This file is intentionally separate from pipeline-config/ref/dependencies.yaml, which is reserved
+# for packaging dependency source configuration.
+
+powershellModules:
+  - name: PSScriptAnalyzer
+    version: latest
+  - name: Pester
+    version: 5.6.1
+

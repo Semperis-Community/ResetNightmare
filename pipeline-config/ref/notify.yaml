@@ -1,0 +1,25 @@
+# Notification policy configuration for reusable notification workflow.
+
+# Defaults apply to all workflows unless overridden under workflows.<name>.
+defaults:
+  enableTeams: false
+  enableEmail: false
+  notifyOnSuccess: false
+  notifyOnSuccessTeams: false
+  notifyOnSuccessEmail: false
+  emailSubjectPrefix: "[{repository}]"
+
+# Per-workflow overrides matched against the source_workflow input.
+workflows:
+  ci-core:
+    notifyOnSuccess: false
+    notifyOnSuccessTeams: false
+    notifyOnSuccessEmail: false
+  release:
+    notifyOnSuccess: true
+    notifyOnSuccessTeams: true
+    notifyOnSuccessEmail: true
+  changelog:
+    notifyOnSuccess: false
+    notifyOnSuccessTeams: false
+    notifyOnSuccessEmail: false

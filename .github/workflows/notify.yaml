@@ -1,0 +1,76 @@
+name: Notify Wrapper
+
+on:
+  workflow_call:
+    inputs:
+      source_workflow:
+        description: Source workflow name.
+        required: true
+        type: string
+      status:
+        description: Workflow status (success, failure, cancelled).
+        required: true
+        type: string
+      ref:
+        description: Branch or tag reference.
+        required: true
+        type: string
+      run_url:
+        description: URL to the workflow run.
+        required: true
+        type: string
+      summary:
+        description: Optional short diagnostic summary.
+        required: false
+        default: ""
+        type: string
+      notify_on_success:
+        description: Emit notifications for successful runs.
+        required: false
+        default: false
+        type: boolean
+      notify_on_success_teams:
+        description: Emit Microsoft Teams notifications for successful runs.
+        required: false
+        default: false
+        type: boolean
+      notify_on_success_email:
+        description: Emit email notifications for successful runs.
+        required: false
+        default: false
+        type: boolean
+      notify_config_file:
+        description: Path to the notify policy config file in the repository.
+        required: true
+        type: string
+    secrets:
+      TEAMS_WEBHOOK_URL:
+        required: false
+      SMTP_HOST:
+        required: false
+      SMTP_PORT:
+        required: false
+      SMTP_USERNAME:
+        required: false
+      SMTP_PASSWORD:
+        required: false
+      EMAIL_FROM:
+        required: false
+      EMAIL_TO:
+        required: false
+
+jobs:
+  notify:
+    if: ${{ vars.PIPELINE_ENABLED == 'true' }}
+    uses: Semperis-Community/.github/.github/workflows/notify-reusable.yaml@v1.0.0
+    with:
+      source_workflow: ${{ inputs.source_workflow }}
+      status: ${{ inputs.status }}
+      ref: ${{ inputs.ref }}
+      run_url: ${{ inputs.run_url }}
+      summary: ${{ inputs.summary }}
+      notify_on_success: ${{ inputs.notify_on_success }}
+      notify_on_success_teams: ${{ inputs.notify_on_success_teams }}
+      notify_on_success_email: ${{ inputs.notify_on_success_email }}
+      notify_config_file: ${{ inputs.notify_config_file }}
+    secrets: inherit

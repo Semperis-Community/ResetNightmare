@@ -1,0 +1,37 @@
+{
+  "version": "0.2",
+  "language": "en",
+  "allowCompoundWords": true,
+  "ignorePaths": [
+    ".git/**",
+    "node_modules/**",
+    "out/**",
+    "TestResults/**"
+  ],
+  "words": [
+    "Semperis",
+    "PSScriptAnalyzer",
+    "Pester",
+    "PesterConfiguration",
+    "PSGallery",
+    "PowerShell",
+    "Contoso",
+    "Fabrikam",
+    "NuGet",
+    "nuget",
+    "pyproject",
+    "pytest",
+    "ruff",
+    "sdist",
+    "workflow_dispatch",
+    "multilang",
+    "powershell",
+    "dotnet",
+    "setupnode",
+    "setupdotnet",
+    "setuppython",
+    "PYPI",
+    "sccache",
+    "depr"
+  ]
+}

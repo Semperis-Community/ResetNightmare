@@ -1,0 +1,9 @@
+# Manual release behavior config for .github/workflows/release.yaml.
+# Used only for workflow_dispatch runs when release_stage is set to "config"
+# or left empty.
+
+configVersion: 1.0.0
+
+# Default stage for manual workflow_dispatch release runs.
+# Allowed: production, alpha, beta, rc
+defaultManualStage: rc

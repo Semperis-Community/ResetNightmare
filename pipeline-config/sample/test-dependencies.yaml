@@ -1,0 +1,47 @@
+# Example dependency reference file for the repository named provisioning.
+#
+# Required sections for current workflow usage:
+# - powershellRepositories: upstream release-backed repos that provide PowerShell content
+# - powershellModules: module list to install during CI and release jobs
+#
+# Optional sections for future or repo-specific use:
+# - nugetSources: NuGet package feeds for .NET dependency resolution
+# - pythonIndexes: Python package indexes for Python dependency resolution
+# - pythonPackages: Python tool packages installed before build/test steps
+#
+# This sample treats upstream dependencies as release-backed repos rather than package feeds.
+#
+# Version fields:
+#   Omit 'version' or set it to "latest" to always install the newest available version.
+#   Set 'version' to a specific SemVer string (e.g. "5.6.1") to pin to that exact release.
+
+powershellRepositories:
+  - name: SampleRepository
+    sourceLocation: https://packages.example.com/powershell
+    installationPolicy: Trusted
+
+# PowerShell modules to install in CI and release jobs.
+# Required for the current sample because the setup action uses this list when present.
+powershellModules:
+  - name: PSScriptAnalyzer
+    version: latest
+  - name: Pester
+    version: 5.6.1
+
+# Optional NuGet feed examples for .NET package restoration.
+nugetSources:
+  - name: NuGet.org
+    url: https://api.nuget.org/v3/index.json
+
+# Optional Python index examples for Python package restoration.
+pythonIndexes:
+  - name: PyPI
+    url: https://pypi.org/simple
+
+# Optional Python tool packages installed before build and test steps.
+# When present, this list replaces the default set (build, pytest).
+pythonPackages:
+  - name: build
+    version: latest
+  - name: pytest
+    version: latest

@@ -1,0 +1,15 @@
+# Release stage detection config used by .github/workflows/release.yaml.
+# The first matching stagePatterns entry wins.
+# If no pattern matches, defaultStage is used.
+
+configVersion: 1.0.0
+
+defaultStage: production
+
+stagePatterns:
+  - pattern: '-alpha\.'
+    stage: alpha
+  - pattern: '-beta\.'
+    stage: beta
+  - pattern: '-rc\.'
+    stage: rc

@@ -1,0 +1,103 @@
+name: Setup PowerShell Tools
+description: Install PowerShell modules used for linting and testing
+
+inputs:
+  modules:
+    description: Comma-separated PowerShell module names
+    required: false
+    default: PSScriptAnalyzer,Pester
+  dependency-file:
+    description: Optional path to a YAML file that defines external PowerShell repositories
+    required: false
+    default: pipeline-config/ref/test-dependencies.yaml
+
+runs:
+  using: composite
+  steps:
+    - name: Install PowerShell modules
+      shell: pwsh
+      run: |
+        # Stop on unexpected errors outside of module install try/catch blocks.
+        $ErrorActionPreference = "Stop"
+        # Parse and normalize the comma-separated module list from action input.
+        $moduleList = "${{ inputs.modules }}" -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+        # Optional YAML file containing external repository definitions.
+        $dependencyFile = "${{ inputs.dependency-file }}"
+        . ./.github/actions/setup-powershell-tools/Resolve-DependencyConfig.ps1
+        $resolvedDependencyConfig = Resolve-SetupPowerShellToolsDependencyConfig -DependencyFile $dependencyFile -ModuleList $moduleList
+        # Track failed installs so we can fail once with a summary at the end.
+        $failedModules = @()
+        # Persist failure details to a runner-local file for troubleshooting.
+        $logFile = Join-Path $env:RUNNER_TEMP "setup-powershell-tools-failures.log"
+
+        # Start with a clean log file for this action run.
+        if (Test-Path $logFile) {
+          Remove-Item -Path $logFile -Force
+        }
+
+        New-Item -ItemType File -Path $logFile -Force | Out-Null
+
+        # Configure optional external repositories before module installation.
+        if ([string]::IsNullOrWhiteSpace($dependencyFile) -eq $false -and -not $resolvedDependencyConfig.DependencyFileFound) {
+          Write-Host "Dependency file '$dependencyFile' not found. Continuing with default repositories."
+        }
+
+        foreach ($repo in $resolvedDependencyConfig.Repositories) {
+          $repoName = $repo.Name
+          $repoUrl = $repo.SourceLocation
+          $installationPolicy = $repo.InstallationPolicy
+          $existingRepo = Get-PSRepository -Name $repoName -ErrorAction SilentlyContinue
+
+          if ($null -eq $existingRepo) {
+            try {
+              Register-PSRepository -Name $repoName -SourceLocation $repoUrl -InstallationPolicy $installationPolicy -ErrorAction Stop
+              Write-Host "Registered external PowerShell repository '$repoName' ($repoUrl)."
+            }
+            catch {
+              throw "Failed to register repository '$repoName' with URL '$repoUrl'. $($_.Exception.Message)"
+            }
+          }
+          else {
+            Set-PSRepository -Name $repoName -InstallationPolicy $installationPolicy -ErrorAction Stop
+            Write-Host "Using existing PowerShell repository '$repoName'."
+          }
+        }
+
+        # Build the module install list.
+        # If the dependency file defines a powershellModules section, use it - supports an optional
+        # 'version' field per entry ("latest" or a pinned SemVer string such as "5.6.1").
+        # Otherwise fall back to the comma-separated modules action input, installing each at latest.
+        $modulesToInstall = @($resolvedDependencyConfig.ModulesToInstall)
+
+        # Trust PSGallery and install each requested module.
+        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+        foreach ($mod in $modulesToInstall) {
+          try {
+            $installArgs = @{
+              Name         = $mod.Name
+              Scope        = 'CurrentUser'
+              Force        = $true
+              AllowClobber = $true
+              ErrorAction  = 'Stop'
+            }
+            if ($null -ne $mod.Version) {
+              $installArgs['RequiredVersion'] = $mod.Version
+            }
+            Install-Module @installArgs
+            $label = if ($null -ne $mod.Version) { "$($mod.Name) v$($mod.Version)" } else { "$($mod.Name) (latest)" }
+            Write-Host "Installed module: $label"
+          }
+          catch {
+            # Capture and log per-module failures without aborting the loop.
+            $failedModules += $mod.Name
+            $logLine = "[$(Get-Date -Format o)] Module: $($mod.Name) | Error: $($_.Exception.Message)"
+            Add-Content -Path $logFile -Value $logLine
+            Write-Error "Failed to install module '$($mod.Name)'. Logged to $logFile" -ErrorAction Continue
+          }
+        }
+
+        # Fail the step after attempting all modules if any installs failed.
+        if ($failedModules.Count -gt 0) {
+          throw "Module installation failed for: $($failedModules -join ', '). See log file: $logFile"
+        }
+

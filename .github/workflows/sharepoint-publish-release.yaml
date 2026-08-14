@@ -1,0 +1,19 @@
+name: Publish to SharePoint (Release)
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish-sharepoint:
+    if: ${{ vars.PIPELINE_ENABLED == 'true' }}
+    uses: Semperis-Community/.github/.github/workflows/sharepoint-publish-reusable.yaml@v1.0.0
+    with:
+      release-tag: ${{ github.event.release.tag_name }}
+      release-stage: ${{ contains(github.event.release.tag_name, '-alpha') && 'alpha' || contains(github.event.release.tag_name, '-beta') && 'beta' || contains(github.event.release.tag_name, '-rc') && 'rc' || 'production' }}
+    secrets:
+      SHAREPOINT_RELEASE_CREDENTIALS_SAND: ${{ secrets.SHAREPOINT_RELEASE_CREDENTIALS_SAND }}
+      SHAREPOINT_RELEASE_CREDENTIALS_PROD: ${{ secrets.SHAREPOINT_RELEASE_CREDENTIALS_PROD }}

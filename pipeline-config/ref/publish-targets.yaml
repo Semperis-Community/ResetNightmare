@@ -1,0 +1,58 @@
+# External registry publish targets for the release workflow.
+# secretEnvVar must match an environment variable name declared in the release job's env: block,
+# which in turn maps to a GitHub Actions secret (e.g., PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}).
+# If the secret is not set the publish step emits a warning and skips gracefully.
+# Multiple entries publish to multiple registries in sequence.
+#
+# stages: optional list restricting which release stages trigger this target.
+# Allowed values: alpha, beta, rc, production
+# Omit 'stages' entirely to publish on every stage.
+
+powershellPublishTargets:
+  - name: PSGallery             # Built-in gallery name or a registered private repository name.
+    secretEnvVar: PSGALLERY_API_KEY
+    stages: [production]
+
+nugetPublishTargets:
+  - name: ContosoNuGet
+    url: https://nuget.contoso.example/v3/index.json
+    secretEnvVar: CONTOSO_NUGET_API_KEY
+    stages: [production]
+
+pythonPublishTargets:
+  - name: ContosoPyPI
+    repositoryUrl: https://upload.pypi.contoso.example/legacy/
+    secretEnvVar: CONTOSO_PYPI_API_KEY
+    stages: [production]
+
+# SharePoint targets for uploading release zip archives to internal document libraries.
+# Used for internal distribution of release binaries; compatible with the release-archive publishing step.
+#
+# Fields:
+#   name: display name for logging
+#   enabled: optional bool to enable/disable an individual target. Defaults to true when omitted.
+#   siteUrl: full URL to the SharePoint site (e.g. https://contoso.sharepoint.com/sites/releases)
+#   documentLibrary: name of the document library (e.g. Shared Documents)
+#   folderPath: optional parent path within the library (e.g. /Releases). Workflow appends /<repository>/<stage>.
+#   secretEnvVar: name of env var containing authentication credentials (PAT, app secret, or managed identity token).
+#
+# Authentication: Set the secretEnvVar value in your GitHub environment or repository secrets.
+# For PnP PowerShell, provide either a PAT token or app registration credentials.
+# For Graph API, provide app registration credentials (client_id, client_secret, tenant_id).
+
+sharePointPublishing:
+  enabled: false
+
+sharePointTargets:
+  - name: SandboxRelease       # Display name for logging
+    enabled: true
+    siteUrl: https://semperiscom.sharepoint.com/sites/Sandbox-CommunitySolutions
+    documentLibrary: Shared Documents
+    folderPath: /Releases
+    secretEnvVar: SHAREPOINT_RELEASE_CREDENTIALS_SAND
+  - name: ProductionRelease       # Display name for logging
+    enabled: false
+    siteUrl: https://semperiscom.sharepoint.com/sites/CommunitySolutions
+    documentLibrary: Shared Documents
+    folderPath: /Releases
+    secretEnvVar: SHAREPOINT_RELEASE_CREDENTIALS_PROD
