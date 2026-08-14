@@ -1,0 +1,43 @@
+name: Incident Wrapper
+
+on:
+  workflow_call:
+    inputs:
+      source_workflow:
+        description: Source workflow name.
+        required: true
+        type: string
+      status:
+        description: Workflow status (success, failure, cancelled).
+        required: true
+        type: string
+      ref:
+        description: Branch or tag reference.
+        required: true
+        type: string
+      run_url:
+        description: URL to the workflow run.
+        required: true
+        type: string
+      summary:
+        description: Optional short diagnostic summary.
+        required: false
+        default: ""
+        type: string
+      incident_config_file:
+        description: Path to the incident policy config file in the repository.
+        required: true
+        type: string
+
+jobs:
+  incident:
+    if: ${{ vars.PIPELINE_ENABLED == 'true' }}
+    uses: Semperis-Community/.github/.github/workflows/incident-reusable.yaml@v1.0.0
+    with:
+      source_workflow: ${{ inputs.source_workflow }}
+      status: ${{ inputs.status }}
+      ref: ${{ inputs.ref }}
+      run_url: ${{ inputs.run_url }}
+      summary: ${{ inputs.summary }}
+      incident_config_file: ${{ inputs.incident_config_file }}
+    secrets: inherit

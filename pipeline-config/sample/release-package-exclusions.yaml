@@ -1,0 +1,25 @@
+# Release package exclusion config for the release workflow archive step.
+# Add repository-root relative paths to exclude from the generated zip file.
+# Paths may reference files or directories.
+
+configVersion: 1.0.0
+
+# Default exclusions managed by the pipeline template.
+defaultExclusions:
+  - .gitignore
+  - .cspell.json
+  - .markdownlint.json
+  - .vscode
+  - .github
+  - docs/workflow-references
+  - depr
+  - pipeline-config/ref
+  - pipeline-config/sample
+  - Tests
+
+# Add additional file or directory paths to exclude from the release package.
+# Examples:
+#   - docs/drafts
+#   - scripts/local-only.ps1
+#   - Tests
+additionalExclusions: []

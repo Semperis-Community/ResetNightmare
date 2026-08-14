@@ -1,0 +1,32 @@
+name: Publish to SharePoint (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        required: true
+        type: string
+        description: Release tag to publish from (e.g. v1.2.3)
+      release-stage:
+        required: true
+        type: choice
+        description: Release stage (alpha/beta/rc/production)
+        options:
+          - alpha
+          - beta
+          - rc
+          - production
+
+permissions:
+  contents: read
+
+jobs:
+  publish-sharepoint:
+    if: ${{ vars.PIPELINE_ENABLED == 'true' }}
+    uses: Semperis-Community/.github/.github/workflows/sharepoint-publish-reusable.yaml@v1.0.0
+    with:
+      release-tag: ${{ inputs['release-tag'] }}
+      release-stage: ${{ inputs['release-stage'] }}
+    secrets:
+      SHAREPOINT_RELEASE_CREDENTIALS_SAND: ${{ secrets.SHAREPOINT_RELEASE_CREDENTIALS_SAND }}
+      SHAREPOINT_RELEASE_CREDENTIALS_PROD: ${{ secrets.SHAREPOINT_RELEASE_CREDENTIALS_PROD }}

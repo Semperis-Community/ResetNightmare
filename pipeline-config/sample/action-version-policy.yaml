@@ -1,0 +1,18 @@
+blockedRefs:
+  - main
+  - master
+  - latest
+
+allowlistPrefixes:
+  - ./.github/actions/
+  - ./.github/workflows/
+
+ignorePathGlobs: []
+
+minMajorVersions:
+  actions/checkout: 5
+  actions/setup-node: 5
+  actions/setup-python: 6
+  actions/setup-dotnet: 5
+  actions/upload-artifact: 7
+  actions/github-script: 8

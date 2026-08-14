@@ -1,0 +1,9 @@
+{
+  "releaseStateLookup": {
+    "0": "dev",
+    "1": "alpha",
+    "2": "beta",
+    "5": "RC",
+    "9": "release"
+  }
+}

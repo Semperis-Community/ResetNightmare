@@ -1,0 +1,6 @@
+configVersion: 1.0.0
+enabled: false
+autoCloseOnSuccess: false
+labels:
+  - pipeline-incident
+assignees: []

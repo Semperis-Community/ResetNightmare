@@ -1,0 +1,53 @@
+# Example signing configuration for the pipeline-build release workflow.
+#
+# Keep signing disabled until ALL of the following have been validated:
+#   1. Azure AD App Registration has a federated identity credential for each
+#      signing-enabled stage subject, e.g.:
+#        Subject:  repo:Semperis-Community/pipeline-build:environment:production
+#        Issuer:   https://token.actions.githubusercontent.com
+#        Audience: api://AzureADTokenExchange
+#      See docs/governance/pipeline-secrets-reference.md for full setup steps.
+#   2. The signing certificate and private key are stored in Azure Key Vault.
+#   3. The timestamp server URL is reachable and verified.
+#   4. End-to-end signing has been validated in a non-production stage.
+#
+# Setting enabled: true without completing step 1 causes the release job to
+# fail with AADSTS700213 (no matching federated identity record).
+
+enabled: false
+
+hashAlgorithm: SHA256
+
+# Azure Key Vault signing configuration
+# Uses the following environment variables (GitHub Actions secrets):
+#   - CODESIGN_AZURE_KEYVAULT_NAME: The Key Vault name (e.g., "my-keyvault")
+#   - CODESIGN_AZURE_KEYVAULT_CERT_NAME: Certificate name in Key Vault
+# The signing script constructs the vault URL: https://{vaultName}.vault.azure.net/
+# The private key stays in Key Vault; azureSignTool calls it remotely.
+azureKeyVault:
+  enabled: true
+  # Vault name and cert name are read from CODESIGN_AZURE_* env vars at runtime
+
+# Timestamp server used when applying Authenticode signatures to PowerShell files.
+timestampServer: https://timestamp.digicert.com
+
+artifactScope:
+  powershellScripts: true
+  powershellModules: true
+  nugetPackages: true
+  pythonArtifacts: true
+  releasePackage: true
+
+stagePolicy:
+  alpha:
+    sign: false
+    verify: false
+  beta:
+    sign: false
+    verify: false
+  rc:
+    sign: true
+    verify: true
+  production:
+    sign: true
+    verify: true

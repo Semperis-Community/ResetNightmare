@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+    types:
+      - closed
+  workflow_dispatch:
+    inputs:
+      release_stage:
+        description: "Target release stage for manual runs. Use 'config' to read pipeline-config/ref/manual-release.yaml."
+        required: false
+        default: config
+        type: choice
+        options:
+          - config
+          - production
+          - alpha
+          - beta
+          - rc
+      debug_dependency_access:
+        description: "Run dependency repository access diagnostics."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  actions: read
+  contents: write
+  id-token: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  release:
+    if: ${{ vars.PIPELINE_ENABLED == 'true' && (github.event_name != 'pull_request' || (github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main')) }}
+    uses: Semperis-Community/.github/.github/workflows/release-reusable.yaml@v1.0.0
+    with:
+      release_stage: ${{ github.event_name == 'workflow_dispatch' && inputs.release_stage || 'config' }}
+      debug_dependency_access: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_dependency_access || false }}
+      pkg_dependency_reference_file: pipeline-config/ref/pkg-dependencies.yaml
+      test_dependency_reference_file: pipeline-config/ref/test-dependencies.yaml
+      powershell_tools_file: pipeline-config/ref/powershell-tools.yaml
+      publish_targets_file: pipeline-config/ref/publish-targets.yaml
+      release_state_lookup_file: .github/internal/versioning/releasestate.json
+      legal_disclaimer_template_file: .github/internal/templates/legal-disclaimer-template.txt
+      pipeline_config_file: pipeline-config/ref/pipeline.yaml
+      release_packages_config_file: pipeline-config/ref/release-packages.yaml
+      release_package_exclusions_file: pipeline-config/ref/release-package-exclusions.yaml
+      release_hash_manifest_file: manifest.txt
+      manual_release_config_file: pipeline-config/ref/manual-release.yaml
+      release_stage_config_file: pipeline-config/ref/release-stages.yaml
+      signing_config_file: pipeline-config/ref/signing.yaml
+      notify_config_file: pipeline-config/ref/notify.yaml
+      incident_config_file: pipeline-config/ref/incidents.yaml
+      workflow_contract_version: 1.0.0
+    secrets: inherit
+
+  sharepoint-publish:
+    # workflow_call is used here because gh release create uses GITHUB_TOKEN, which
+    # suppresses the release: published event and prevents the workflow from auto-triggering.
+    if: ${{ needs.release.result == 'success' }}
+    needs:
+      - release
+    uses: Semperis-Community/.github/.github/workflows/sharepoint-publish-reusable.yaml@v1.0.0
+    with:
+      release-tag: ${{ needs.release.outputs.release_tag }}
+      release-stage: ${{ needs.release.outputs.release_stage }}
+    secrets:
+      SHAREPOINT_RELEASE_CREDENTIALS_SAND: ${{ secrets.SHAREPOINT_RELEASE_CREDENTIALS_SAND }}
+      SHAREPOINT_RELEASE_CREDENTIALS_PROD: ${{ secrets.SHAREPOINT_RELEASE_CREDENTIALS_PROD }}

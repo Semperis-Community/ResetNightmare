@@ -1,0 +1,75 @@
+# Pipeline-level configuration for the release workflow.
+
+# Versioning for pipeline configuration and workflow contract compatibility.
+# configVersion tracks schema changes in this file.
+# workflowContractVersion tracks compatibility with workflow validation logic.
+configVersion: 1.0.0
+workflowContractVersion: 1.0.0
+
+# Base name used for the release zip archive and the uploaded artifact.
+# The tag name is appended automatically: <releasePackageName>-<tag>.zip
+# Omit or leave blank to fall back to the GitHub repository name.
+# Optional multi-package output can be configured in pipeline-config/ref/release-packages.yaml.
+# When multi-package config is present and releasePackages is non-empty, one archive per
+# configured package is generated in addition to default output when singlePackage.enabled=true.
+releasePackageName: pipeline-build
+
+# Explicit release versioning policy used when a PR merge to main creates the next tag.
+# method: Choose versioning strategy - 'semver' (default) or 'calver'
+versioningPolicy:
+  # Versioning method: 'semver' for semantic versioning (MAJOR.MINOR.PATCH),
+  # or 'calver' for calendar versioning (YYYY.MM.DD.PATCH)
+  method: semver
+
+  # Semantic versioning configuration (used when method: semver)
+  # initialVersion is used when no existing stable tag exists yet.
+  # defaultIncrement applies when no version label override is present on the merged PR.
+  # digitPositions defines single-digit slot locations used when composing
+  # internal version lookup values for service pack and release stage.
+  # labelOverrides let reviewers select major/minor/patch bumps explicitly via PR labels.
+  semver:
+    initialVersion: 1.0.0
+    defaultIncrement: patch
+    servicePackDigit: 0
+    digitPositions:
+      servicePack: 4
+      releaseStage: 5
+    labelOverrides:
+      major:
+        - release:major
+        - semver:major
+      minor:
+        - release:minor
+        - semver:minor
+      patch:
+        - release:patch
+        - semver:patch
+
+  # Calendar versioning configuration (used when method: calver)
+  # Versions follow format: YYYY.MM.DD.PATCH (e.g., 2026.06.10.0, 2026.06.10.1)
+  # Date is set to release date; patch increments for multiple same-day releases.
+  # digitPositions defines single-digit slot locations used when composing
+  # internal version lookup values for service pack and release stage.
+  calver:
+    format: "YYYY.MM.DD.PATCH"
+    initialVersion: "2026.06.10.0"
+    servicePackDigit: 0
+    digitPositions:
+      servicePack: 4
+      releaseStage: 5
+    labelOverrides:
+      patch:
+        - release:patch
+        - calver:patch
+
+# Patterns to detect the release stage from the tag name.
+# Evaluated in order; first match wins. No match defaults to "production".
+# Stages map to GitHub Environments — create matching environments in
+# Settings > Environments to enable required reviewers and environment-scoped secrets.
+preReleasePatterns:
+  - pattern: '-alpha\.'
+    stage: alpha
+  - pattern: '-beta\.'
+    stage: beta
+  - pattern: '-rc\.'
+    stage: rc
