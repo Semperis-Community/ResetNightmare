@@ -30,48 +30,3126 @@ on:
         default: false
         type: boolean
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   actions: read
   contents: write
   id-token: write
   pull-requests: write
-  issues: write
+
+env:
+  PKG_DEPENDENCY_REFERENCE_FILE: pipeline-config/ref/pkg-dependencies.yaml
+  TEST_DEPENDENCY_REFERENCE_FILE: pipeline-config/ref/test-dependencies.yaml
+  POWERSHELL_TOOLS_FILE: pipeline-config/ref/powershell-tools.yaml
+  PUBLISH_TARGETS_FILE: pipeline-config/ref/publish-targets.yaml
+  RELEASE_STATE_LOOKUP_FILE: .github/internal/versioning/releasestate.json
+  LEGAL_DISCLAIMER_TEMPLATE_FILE: .github/internal/templates/legal-disclaimer-template.txt
+  PIPELINE_CONFIG_FILE: pipeline-config/ref/pipeline.yaml
+  RELEASE_PACKAGES_CONFIG_FILE: pipeline-config/ref/release-packages.yaml
+  RELEASE_PACKAGE_EXCLUSIONS_FILE: pipeline-config/ref/release-package-exclusions.yaml
+  RELEASE_HASH_MANIFEST_FILE: manifest.txt
+  MANUAL_RELEASE_CONFIG_FILE: pipeline-config/ref/manual-release.yaml
+  RELEASE_STAGE_CONFIG_FILE: pipeline-config/ref/release-stages.yaml
+  WORKFLOW_CONTRACT_VERSION: 1.0.0
 
 jobs:
+  validate-repo-structure:
+    # Enforce required repository structure.
+    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main') }}
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Require docs directory
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "docs")) {
+            throw "Required directory 'docs' is missing."
+          }
+
+      - name: Validate pipeline config ref and sample consistency
+        shell: pwsh
+        run: |
+          $configRefRoot = "pipeline-config/ref"
+          $configSampleRoot = "pipeline-config/sample"
+
+          if (-not (Test-Path $configRefRoot)) {
+            Write-Host "Directory '$configRefRoot' is missing. Skipping ref/sample consistency validation."
+            exit 0
+          }
+
+          function Convert-ToStructureShape {
+            param(
+              $Node
+            )
+
+            if ($null -eq $Node) {
+              return @{ __type = "null" }
+            }
+
+            if ($Node -is [System.Collections.IDictionary] -or $Node -is [pscustomobject]) {
+              $shape = [ordered]@{ __type = "object" }
+
+              $propertyNames = @()
+              if ($Node -is [System.Collections.IDictionary]) {
+                $propertyNames = $Node.Keys | ForEach-Object { [string]$_ }
+              }
+              else {
+                $propertyNames = $Node.PSObject.Properties.Name
+              }
+
+              foreach ($name in ($propertyNames | Sort-Object -Unique)) {
+                if ($Node -is [System.Collections.IDictionary]) {
+                  $value = $Node[$name]
+                }
+                else {
+                  $value = $Node.PSObject.Properties[$name].Value
+                }
+
+                $shape[$name] = Convert-ToStructureShape -Node $value
+              }
+
+              return $shape
+            }
+
+            if ($Node -is [System.Collections.IEnumerable] -and -not ($Node -is [string])) {
+              $elementShapes = @()
+              foreach ($item in $Node) {
+                $elementShapes += (Convert-ToStructureShape -Node $item | ConvertTo-Json -Depth 100 -Compress)
+              }
+
+              return @{
+                __type = "array"
+                __elements = @($elementShapes | Sort-Object -Unique)
+              }
+            }
+
+            return @{ __type = "scalar" }
+          }
+
+          function Compare-StructureShape {
+            param(
+              $ReferenceShape,
+              $SampleShape
+            )
+
+            function Get-ShapeKeys {
+              param(
+                $Shape
+              )
+
+              if ($Shape -is [System.Collections.IDictionary]) {
+                return @($Shape.Keys | Where-Object { $_ -ne '__type' } | Sort-Object)
+              }
+
+              return @($Shape.PSObject.Properties.Name | Where-Object { $_ -ne '__type' } | Sort-Object)
+            }
+
+            function Get-ShapeChild {
+              param(
+                $Shape,
+                [string]$Key
+              )
+
+              if ($Shape -is [System.Collections.IDictionary]) {
+                return $Shape[$Key]
+              }
+
+              return $Shape.PSObject.Properties[$Key].Value
+            }
+
+            if ($ReferenceShape.__type -ne $SampleShape.__type) {
+              return $false
+            }
+
+            switch ($ReferenceShape.__type) {
+              'array' {
+                if (@($ReferenceShape.__elements).Count -eq 0) {
+                  return $true
+                }
+
+                $referenceElements = @($ReferenceShape.__elements | Sort-Object -Unique)
+                $sampleElements = @($SampleShape.__elements | Sort-Object -Unique)
+                # Sample config may include additional example array shapes.
+                # Require every reference shape to exist in sample, but allow sample supersets.
+                foreach ($referenceElement in $referenceElements) {
+                  if ($sampleElements -notcontains $referenceElement) {
+                    return $false
+                  }
+                }
+
+                return $true
+              }
+
+              'object' {
+                $referenceKeys = Get-ShapeKeys -Shape $ReferenceShape
+                $sampleKeys = Get-ShapeKeys -Shape $SampleShape
+
+                if (@(Compare-Object -ReferenceObject $referenceKeys -DifferenceObject $sampleKeys).Count -ne 0) {
+                  return $false
+                }
+
+                foreach ($key in $referenceKeys) {
+                  if (-not (Compare-StructureShape -ReferenceShape (Get-ShapeChild -Shape $ReferenceShape -Key $key) -SampleShape (Get-ShapeChild -Shape $SampleShape -Key $key))) {
+                    return $false
+                  }
+                }
+
+                return $true
+              }
+
+              default {
+                return $true
+              }
+            }
+          }
+
+          $refRoot = (Resolve-Path $configRefRoot).Path
+          $refFiles = Get-ChildItem -Path $configRefRoot -File -Recurse
+
+          foreach ($refFile in $refFiles) {
+            $relativePath = [System.IO.Path]::GetRelativePath($refRoot, $refFile.FullName)
+            $samplePath = Join-Path $configSampleRoot $relativePath
+
+            if (-not (Test-Path $samplePath)) {
+              throw "Sample file '$samplePath' is missing for '$($refFile.FullName)'."
+            }
+
+            $extension = [System.IO.Path]::GetExtension($refFile.FullName).ToLowerInvariant()
+            if ($extension -in @('.yaml', '.yml')) {
+              if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+                if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+                  Register-PSRepository -Default -ErrorAction Stop
+                }
+
+                Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+                Import-Module powershell-yaml -ErrorAction Stop
+              }
+
+              try {
+                $refNode = Get-Content -Path $refFile.FullName -Raw | ConvertFrom-Yaml -ErrorAction Stop
+              }
+              catch {
+                throw "Unable to parse YAML reference file '$($refFile.FullName)': $($_.Exception.Message)"
+              }
+
+              try {
+                $sampleNode = Get-Content -Path $samplePath -Raw | ConvertFrom-Yaml -ErrorAction Stop
+              }
+              catch {
+                throw "Unable to parse YAML sample file '$samplePath': $($_.Exception.Message)"
+              }
+            }
+            else {
+              $refNode = Get-Content -Path $refFile.FullName -Raw
+              $sampleNode = Get-Content -Path $samplePath -Raw
+            }
+
+            $refShape = Convert-ToStructureShape -Node $refNode
+            $sampleShape = Convert-ToStructureShape -Node $sampleNode
+
+            if (-not (Compare-StructureShape -ReferenceShape $refShape -SampleShape $sampleShape)) {
+              throw "Sample file '$samplePath' does not match the structure of '$($refFile.FullName)'. Values may differ, but keys/nesting must align."
+            }
+          }
+
+      - name: Validate pipeline config contract versions
+        shell: pwsh
+        run: |
+          $pipelineConfigFile = "${{ env.PIPELINE_CONFIG_FILE }}"
+          if (-not (Test-Path $pipelineConfigFile)) {
+            throw "Required pipeline config '$pipelineConfigFile' is missing."
+          }
+
+          if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+            if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+              Register-PSRepository -Default -ErrorAction Stop
+            }
+            Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            Import-Module powershell-yaml -ErrorAction Stop
+          }
+
+          $pipelineConfig = Get-Content -Path $pipelineConfigFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+          if ([string]::IsNullOrWhiteSpace($pipelineConfig.configVersion)) {
+            throw "Pipeline config '$pipelineConfigFile' must define 'configVersion'."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($pipelineConfig.workflowContractVersion)) {
+            throw "Pipeline config '$pipelineConfigFile' must define 'workflowContractVersion'."
+          }
+
+          $semVerPattern = '^\d+\.\d+\.\d+$'
+          if ($pipelineConfig.configVersion -notmatch $semVerPattern) {
+            throw "configVersion '$($pipelineConfig.configVersion)' in '$pipelineConfigFile' must use semantic versioning (MAJOR.MINOR.PATCH)."
+          }
+
+          if ($pipelineConfig.workflowContractVersion -notmatch $semVerPattern) {
+            throw "workflowContractVersion '$($pipelineConfig.workflowContractVersion)' in '$pipelineConfigFile' must use semantic versioning (MAJOR.MINOR.PATCH)."
+          }
+
+          $supportedConfigVersions = @('1.0.0')
+          if ($pipelineConfig.configVersion -notin $supportedConfigVersions) {
+            throw "Unsupported configVersion '$($pipelineConfig.configVersion)' in '$pipelineConfigFile'. Supported versions: $($supportedConfigVersions -join ', ')."
+          }
+
+          $expectedContractVersion = "${{ env.WORKFLOW_CONTRACT_VERSION }}"
+          if ($pipelineConfig.workflowContractVersion -ne $expectedContractVersion) {
+            throw "workflowContractVersion '$($pipelineConfig.workflowContractVersion)' does not match release workflow contract '$expectedContractVersion'."
+          }
+
+  spell-check:
+    # Check spelling in docs and source comments/files before release.
+    needs: validate-repo-structure
+    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main') }}
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: latest
+
+      - name: Run cspell
+        if: github.event_name == 'pull_request'
+        shell: pwsh
+        run: |
+          ./scripts/run-cspell.ps1
+
+      - name: Run cspell (advisory)
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          $hadIssues = $false
+
+          try {
+            ./scripts/run-cspell.ps1
+          }
+          catch {
+            $hadIssues = $true
+            Write-Warning "cspell reported issues in advisory mode. $($_.Exception.Message)"
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+            $hadIssues = $true
+          }
+
+          if ($hadIssues) {
+            Write-Host "::warning::cspell found issues (advisory mode). Review step output and summary."
+          }
+
+          exit 0
+
+  markdownlint:
+    # Check repository markdown formatting separately from spelling before release.
+    needs: validate-repo-structure
+    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main') }}
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: latest
+
+      - name: Run markdownlint
+        if: github.event_name == 'pull_request'
+        shell: pwsh
+        run: |
+          $markdownlintArgs = @(
+            "--yes"
+            "markdownlint-cli2"
+            "README.md"
+            "docs/**/*.md"
+          )
+
+          & npx @markdownlintArgs
+
+      - name: Run markdownlint (advisory)
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          $markdownlintArgs = @(
+            "--yes"
+            "markdownlint-cli2"
+            "README.md"
+            "docs/**/*.md"
+          )
+
+          $hadIssues = $false
+
+          try {
+            & npx @markdownlintArgs
+            if ($LASTEXITCODE -ne 0) {
+              $hadIssues = $true
+            }
+          }
+          catch {
+            $hadIssues = $true
+            Write-Warning "markdownlint reported issues in advisory mode. $($_.Exception.Message)"
+          }
+
+          if ($hadIssues) {
+            Write-Host "::warning::markdownlint found issues (advisory mode). Review step output."
+          }
+
+          exit 0
+
+  detect-stage:
+    # Resolve the release stage (alpha/beta/rc/production) from tag patterns defined
+    # in pipeline-config/ref/release-stages.yaml. Used to select the GitHub Environment and filter publish targets.
+    needs:
+      - validate-repo-structure
+      - create-release-tag
+    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main') }}
+    runs-on: windows-2022
+    outputs:
+      stage: ${{ steps.resolve.outputs.stage }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Resolve release stage from tag
+        id: resolve
+        shell: pwsh
+        run: |
+          $stage = "production"
+
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $manualStage = "${{ inputs.release_stage }}".Trim().ToLowerInvariant()
+
+            if ([string]::IsNullOrWhiteSpace($manualStage) -or $manualStage -eq 'config') {
+              $manualConfigFile = "${{ env.MANUAL_RELEASE_CONFIG_FILE }}"
+              if (Test-Path $manualConfigFile) {
+                if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+                  if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+                    Register-PSRepository -Default -ErrorAction Stop
+                  }
+                  Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+                  Import-Module powershell-yaml -ErrorAction Stop
+                }
+
+                $manualConfig = Get-Content -Path $manualConfigFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+                if ([string]::IsNullOrWhiteSpace([string]$manualConfig.defaultManualStage) -eq $false) {
+                  $manualStage = [string]$manualConfig.defaultManualStage
+                }
+              }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($manualStage) -eq $false) {
+              $stage = $manualStage.Trim().ToLowerInvariant()
+            }
+
+            if ($stage -notin @('production', 'alpha', 'beta', 'rc')) {
+              throw "Invalid manual release stage '$stage'. Allowed values: production, alpha, beta, rc."
+            }
+          }
+
+          if ("${{ github.event_name }}" -eq "pull_request" -or "${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tag = "${{ needs.create-release-tag.outputs.release_tag }}"
+          }
+          else {
+            $tag = "${{ github.ref_name }}"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            throw "Unable to resolve release tag for stage detection."
+          }
+
+          $stageConfigFile = "${{ env.RELEASE_STAGE_CONFIG_FILE }}"
+
+          if ("${{ github.event_name }}" -ne "workflow_dispatch" -and (Test-Path $stageConfigFile)) {
+            if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+              if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+                Register-PSRepository -Default -ErrorAction Stop
+              }
+              Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+              Import-Module powershell-yaml -ErrorAction Stop
+            }
+
+            $stageConfig = Get-Content -Path $stageConfigFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+
+            if ([string]::IsNullOrWhiteSpace([string]$stageConfig.defaultStage) -eq $false) {
+              $stage = [string]$stageConfig.defaultStage
+            }
+
+            $patterns = @()
+            if ($null -ne $stageConfig.stagePatterns) {
+              $patterns = @($stageConfig.stagePatterns)
+            }
+
+            foreach ($entry in $patterns) {
+              if ($tag -match $entry.pattern) {
+                $stage = $entry.stage
+                break
+              }
+            }
+          }
+
+          Write-Host "Tag: $tag  ->  Stage: $stage"
+          "stage=$stage" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+  verify-authoritative-ci:
+    # Block release unless authoritative CI checks passed.
+    # For manual workflow_dispatch runs, allow fallback to the latest successful
+    # default-branch ci-core run when an exact-SHA match does not exist yet.
+    needs:
+      - validate-repo-structure
+      - spell-check
+      - markdownlint
+    if: ${{ github.event_name != 'pull_request' || (github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main') }}
+    runs-on: windows-2022
+
+    steps:
+      - name: Verify CI checks and tests succeeded
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const headSha = context.eventName === 'pull_request'
+              ? context.payload.pull_request.merge_commit_sha
+              : context.sha;
+            const eventName = context.eventName;
+            const defaultBranch = context.payload.repository?.default_branch || "main";
+            const requiredJobs = ["validate-repo-structure", "spell-check", "markdownlint", "action-version-audit", "security-scan", "lint-and-test"];
+            const apiRetryAttempts = 4;
+            const apiRetryBaseDelayMs = 2000;
+
+            function sleep(ms) {
+              return new Promise((resolve) => setTimeout(resolve, ms));
+            }
+
+            function isRetriableError(error) {
+              const status = error?.status;
+              if ([429, 500, 502, 503, 504].includes(status)) {
+                return true;
+              }
+
+              const code = String(error?.code || "").toLowerCase();
+              if (["etimedout", "econnreset", "eai_again", "enotfound", "ecanceled", "aborterror"].includes(code)) {
+                return true;
+              }
+
+              const message = String(error?.message || "").toLowerCase();
+              if (
+                message.includes("unexpected end of json input") ||
+                message.includes("socket hang up") ||
+                message.includes("request timeout") ||
+                message.includes("timed out")
+              ) {
+                return true;
+              }
+
+              return false;
+            }
+
+            function formatErrorDetails(error) {
+              const status = error?.status ? `status=${error.status}` : "status=unknown";
+              const code = error?.code ? `code=${error.code}` : "code=unknown";
+              const requestUrl = error?.request?.url ? `url=${error.request.url}` : "url=unknown";
+              const message = error?.message || "Unknown error";
+              return `${status}; ${code}; ${requestUrl}; message=${message}`;
+            }
+
+            async function withRetry(operationName, operation) {
+              let lastError = null;
+
+              for (let attempt = 1; attempt <= apiRetryAttempts; attempt += 1) {
+                try {
+                  return await operation();
+                }
+                catch (error) {
+                  lastError = error;
+                  const details = formatErrorDetails(error);
+                  const retriable = isRetriableError(error);
+
+                  if (!retriable || attempt === apiRetryAttempts) {
+                    throw new Error(`${operationName} failed after ${attempt}/${apiRetryAttempts} attempt(s): ${details}`);
+                  }
+
+                  const delayMs = apiRetryBaseDelayMs * (2 ** (attempt - 1)) + Math.floor(Math.random() * 500);
+                  core.warning(
+                    `${operationName} transient error on attempt ${attempt}/${apiRetryAttempts}: ${details}. ` +
+                    `Retrying in ${delayMs}ms.`
+                  );
+                  await sleep(delayMs);
+                }
+              }
+
+              throw new Error(`${operationName} exhausted retries: ${formatErrorDetails(lastError)}`);
+            }
+
+            async function findSuccessfulRunForSha(targetSha) {
+              const workflowRuns = await withRetry("listWorkflowRuns(ci-core)", () =>
+                github.paginate(github.rest.actions.listWorkflowRuns, {
+                  owner,
+                  repo,
+                  workflow_id: "ci-core.yaml",
+                  status: "completed",
+                  per_page: 100
+                })
+              );
+
+              return workflowRuns.find(
+                (run) => run.head_sha === targetSha && run.conclusion === "success"
+              );
+            }
+
+            try {
+              let matchingRun = null;
+
+              try {
+                matchingRun = await findSuccessfulRunForSha(headSha);
+              }
+              catch (error) {
+                core.warning(`Initial authoritative CI lookup failed: ${error.message}`);
+              }
+
+              if (!matchingRun && eventName !== "workflow_dispatch") {
+                const maxAttempts = 20;
+                const pollDelayMs = 15000;
+
+                for (let attempt = 1; attempt <= maxAttempts && !matchingRun; attempt += 1) {
+                  core.info(
+                    `Waiting for a successful ci-core.yaml run for ${headSha} ` +
+                    `(attempt ${attempt}/${maxAttempts}).`
+                  );
+                  await sleep(pollDelayMs);
+
+                  try {
+                    matchingRun = await findSuccessfulRunForSha(headSha);
+                  }
+                  catch (error) {
+                    core.warning(
+                      `Authoritative CI poll attempt ${attempt}/${maxAttempts} failed due to API error: ${error.message}`
+                    );
+                  }
+                }
+              }
+
+              if (!matchingRun && eventName === "workflow_dispatch") {
+                const workflowRuns = await withRetry("listWorkflowRuns(ci-core) fallback", () =>
+                  github.paginate(github.rest.actions.listWorkflowRuns, {
+                    owner,
+                    repo,
+                    workflow_id: "ci-core.yaml",
+                    status: "completed",
+                    per_page: 100
+                  })
+                );
+
+                matchingRun = workflowRuns.find(
+                  (run) => run.head_branch === defaultBranch && run.conclusion === "success"
+                );
+
+                if (matchingRun) {
+                  core.warning(
+                    `No successful exact-SHA ci-core run found for ${headSha}. ` +
+                    `Using latest successful ci-core run ${matchingRun.id} on ${defaultBranch} (${matchingRun.head_sha}) for workflow_dispatch.`
+                  );
+                }
+              }
+
+              if (!matchingRun) {
+                core.setFailed(
+                  `No successful run of ci-core.yaml found for commit ${headSha}. ` +
+                  `Release is blocked until authoritative CI passes${eventName === "workflow_dispatch" ? ` on ${defaultBranch}` : ""}.`
+                );
+                return;
+              }
+
+              const jobs = await withRetry(`listJobsForWorkflowRun(${matchingRun.id})`, () =>
+                github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+                  owner,
+                  repo,
+                  run_id: matchingRun.id,
+                  per_page: 100
+                })
+              );
+
+              const failedOrMissing = [];
+              for (const jobName of requiredJobs) {
+                const matches = jobs.filter(
+                  (job) => job.name === jobName || job.name.startsWith(`${jobName} /`)
+                );
+                if (matches.length === 0) {
+                  failedOrMissing.push(`${jobName} (missing)`);
+                  continue;
+                }
+
+                const unsuccessful = matches.filter((job) => job.conclusion !== "success");
+                if (unsuccessful.length > 0) {
+                  failedOrMissing.push(
+                    `${jobName} (${unsuccessful.map((job) => job.conclusion || "unknown").join(", ")})`
+                  );
+                }
+              }
+
+              if (failedOrMissing.length > 0) {
+                core.setFailed(
+                  `Authoritative CI run ${matchingRun.id} did not satisfy required checks: ${failedOrMissing.join("; ")}`
+                );
+                return;
+              }
+
+              core.info(`Authoritative CI run ${matchingRun.id} passed all required checks for ${headSha}.`);
+            }
+            catch (error) {
+              core.setFailed(`verify-authoritative-ci failed due to unrecoverable API/query error: ${error.message}`);
+            }
+
+  create-release-tag:
+    # Create a release tag from policy on main branch pushes, merged PRs, and manual workflow_dispatch runs.
+    needs:
+      - validate-repo-structure
+      - spell-check
+      - markdownlint
+      - verify-authoritative-ci
+    if: >
+      (github.event_name != 'pull_request' ||
+       (github.event.action == 'closed' &&
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.base.ref == 'main')) &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+       (github.event_name == 'pull_request' &&
+        github.event.action == 'closed' &&
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.base.ref == 'main' &&
+        !startsWith(github.event.pull_request.head.ref, 'automation/changelog-')) ||
+       github.event_name == 'workflow_dispatch')
+    runs-on: windows-2022
+    outputs:
+      release_tag: ${{ steps.versioning.outputs.resolved_tag }}
+      tag_already_exists: ${{ steps.versioning.outputs.tag_already_exists }}
+      version_lookup_code: ${{ steps.versioning.outputs.version_lookup_code }}
+      service_pack_digit: ${{ steps.versioning.outputs.service_pack_digit }}
+      release_stage_digit: ${{ steps.versioning.outputs.release_stage_digit }}
+      numeric_version_values: ${{ steps.versioning.outputs.numeric_version_values }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.merge_commit_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Fetch tags
+        shell: pwsh
+        run: |
+          git fetch --tags --force
+
+      - name: Resolve next release tag from versioning policy
+        id: versioning
+        shell: pwsh
+        env:
+          TARGET_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.merge_commit_sha || github.sha }}
+          PR_LABELS_JSON: '[]'
+          PIPELINE_CONFIG_FILE: ${{ env.PIPELINE_CONFIG_FILE }}
+          RELEASE_STATE_LOOKUP_FILE: ${{ env.RELEASE_STATE_LOOKUP_FILE }}
+          MANUAL_RELEASE_CONFIG_FILE: ${{ env.MANUAL_RELEASE_CONFIG_FILE }}
+          MANUAL_RELEASE_STAGE: ${{ inputs.release_stage }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+
+          function Normalize-YamlScalar {
+            param([string]$Value)
+
+            if ($null -eq $Value) {
+              return ''
+            }
+
+            $trimmed = $Value.Trim()
+            if (($trimmed.StartsWith("'") -and $trimmed.EndsWith("'")) -or ($trimmed.StartsWith('"') -and $trimmed.EndsWith('"'))) {
+              return $trimmed.Substring(1, $trimmed.Length - 2)
+            }
+
+            return $trimmed
+          }
+
+          function Parse-PipelineVersioningPolicyFallback {
+            param([string]$RawYaml)
+
+            $policy = [ordered]@{
+              method = 'semver'
+              semver = [ordered]@{
+                initialVersion = $null
+                defaultIncrement = $null
+                servicePackDigit = 0
+                digitPositions = [ordered]@{
+                  servicePack = 4
+                  releaseStage = 5
+                }
+                labelOverrides = [ordered]@{
+                  major = @()
+                  minor = @()
+                  patch = @()
+                }
+              }
+              calver = [ordered]@{
+                format = "YYYY.MM.DD.PATCH"
+                initialVersion = $null
+                servicePackDigit = 0
+                digitPositions = [ordered]@{
+                  servicePack = 4
+                  releaseStage = 5
+                }
+                labelOverrides = [ordered]@{
+                  patch = @()
+                }
+              }
+            }
+
+            $lines = $RawYaml -split "`r?`n"
+            $inVersioningPolicy = $false
+            $activeSection = $null
+            $inLabelOverrides = $false
+            $activeIncrement = $null
+
+            foreach ($line in $lines) {
+              if ($line -match '^\s*#' -or [string]::IsNullOrWhiteSpace($line)) {
+                continue
+              }
+
+              if ($line -match '^versioningPolicy:\s*$') {
+                $inVersioningPolicy = $true
+                $activeSection = $null
+                $inLabelOverrides = $false
+                $activeIncrement = $null
+                continue
+              }
+
+              if (-not $inVersioningPolicy) {
+                continue
+              }
+
+              if ($line -notmatch '^  ') {
+                break
+              }
+
+              if ($line -match '^  method:\s*(.+)$') {
+                $policy.method = Normalize-YamlScalar $Matches[1]
+                continue
+              }
+
+              if ($line -match '^  (semver|calver):\s*$') {
+                $activeSection = $Matches[1]
+                $inLabelOverrides = $false
+                $activeIncrement = $null
+                continue
+              }
+
+              if ($null -eq $activeSection) {
+                continue
+              }
+
+              if ($activeSection -eq 'semver') {
+                if ($line -match '^    initialVersion:\s*(.+)$') {
+                  $policy.semver.initialVersion = Normalize-YamlScalar $Matches[1]
+                  continue
+                }
+
+                if ($line -match '^    defaultIncrement:\s*(.+)$') {
+                  $policy.semver.defaultIncrement = Normalize-YamlScalar $Matches[1]
+                  continue
+                }
+
+                if ($line -match '^    servicePackDigit:\s*(\d+)$') {
+                  $policy.semver.servicePackDigit = [int]$Matches[1]
+                  continue
+                }
+
+                if ($line -match '^    digitPositions:\s*$') {
+                  continue
+                }
+
+                if ($line -match '^      servicePack:\s*(\d+)$') {
+                  $policy.semver.digitPositions.servicePack = [int]$Matches[1]
+                  continue
+                }
+
+                if ($line -match '^      releaseStage:\s*(\d+)$') {
+                  $policy.semver.digitPositions.releaseStage = [int]$Matches[1]
+                  continue
+                }
+
+                if ($line -match '^    labelOverrides:\s*$') {
+                  $inLabelOverrides = $true
+                  $activeIncrement = $null
+                  continue
+                }
+
+                if ($inLabelOverrides) {
+                  if ($line -match '^      (major|minor|patch):\s*$') {
+                    $activeIncrement = $Matches[1]
+                    continue
+                  }
+
+                  if ($line -match '^        -\s*(.+)$' -and -not [string]::IsNullOrWhiteSpace($activeIncrement)) {
+                    $policy.semver.labelOverrides[$activeIncrement] += (Normalize-YamlScalar $Matches[1])
+                    continue
+                  }
+
+                  if ($line -match '^      [A-Za-z0-9_\-]+:\s*') {
+                    $activeIncrement = $null
+                  }
+                }
+              }
+              elseif ($activeSection -eq 'calver') {
+                if ($line -match '^    format:\s*(.+)$') {
+                  $policy.calver.format = Normalize-YamlScalar $Matches[1]
+                  continue
+                }
+
+                if ($line -match '^    initialVersion:\s*(.+)$') {
+                  $policy.calver.initialVersion = Normalize-YamlScalar $Matches[1]
+                  continue
+                }
+
+                if ($line -match '^    servicePackDigit:\s*(\d+)$') {
+                  $policy.calver.servicePackDigit = [int]$Matches[1]
+                  continue
+                }
+
+                if ($line -match '^    digitPositions:\s*$') {
+                  continue
+                }
+
+                if ($line -match '^      servicePack:\s*(\d+)$') {
+                  $policy.calver.digitPositions.servicePack = [int]$Matches[1]
+                  continue
+                }
+
+                if ($line -match '^      releaseStage:\s*(\d+)$') {
+                  $policy.calver.digitPositions.releaseStage = [int]$Matches[1]
+                  continue
+                }
+
+                if ($line -match '^    labelOverrides:\s*$') {
+                  $inLabelOverrides = $true
+                  $activeIncrement = $null
+                  continue
+                }
+
+                if ($inLabelOverrides) {
+                  if ($line -match '^      patch:\s*$') {
+                    $activeIncrement = 'patch'
+                    continue
+                  }
+
+                  if ($line -match '^        -\s*(.+)$' -and $activeIncrement -eq 'patch') {
+                    $policy.calver.labelOverrides.patch += (Normalize-YamlScalar $Matches[1])
+                    continue
+                  }
+
+                  if ($line -match '^      [A-Za-z0-9_\-]+:\s*') {
+                    $activeIncrement = $null
+                  }
+                }
+              }
+            }
+
+            return [pscustomobject]$policy
+          }
+
+          function Parse-ManualReleaseConfigFallback {
+            param([string]$RawYaml)
+
+            $config = [ordered]@{ defaultManualStage = $null }
+            $lines = $RawYaml -split "`r?`n"
+            foreach ($line in $lines) {
+              if ($line -match '^\s*#' -or [string]::IsNullOrWhiteSpace($line)) {
+                continue
+              }
+
+              if ($line -match '^defaultManualStage:\s*(.+)$') {
+                $config.defaultManualStage = Normalize-YamlScalar $Matches[1]
+                break
+              }
+            }
+
+            return [pscustomobject]$config
+          }
+
+          function Read-YamlConfig {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$Path,
+              [Parameter(Mandatory = $true)]
+              [string]$ConfigName,
+              [Parameter(Mandatory = $true)]
+              [scriptblock]$FallbackParser,
+              [Parameter(Mandatory = $true)]
+              [bool]$CanUseConvertFromYaml
+            )
+
+            $raw = Get-Content -Path $Path -Raw -ErrorAction Stop
+            if ($CanUseConvertFromYaml) {
+              return $raw | ConvertFrom-Yaml -ErrorAction Stop
+            }
+
+            Write-Host "ConvertFrom-Yaml unavailable. Using deterministic fallback parser for $ConfigName."
+            return & $FallbackParser $raw
+          }
+
+          function Test-GitTagExists {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$TagName
+            )
+
+            # Avoid using native command exit codes for control flow under ErrorActionPreference=Stop.
+            $tagRefs = @(git for-each-ref --format='%(refname:short)' -- "refs/tags/$TagName")
+            return $tagRefs -contains $TagName
+          }
+
+          function Get-StableReleaseTagForCommit {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$CommitSha,
+              [Parameter(Mandatory = $true)]
+              [string]$VersioningMethod
+            )
+
+            $pointingTags = @(git for-each-ref --points-at $CommitSha --format='%(refname:short)' refs/tags)
+            if ($VersioningMethod -eq 'calver') {
+              return $pointingTags | Where-Object { $_ -match '^v\d{4}\.\d{2}\.\d{2}\.\d+$' } | Select-Object -First 1
+            }
+            else {
+              return $pointingTags | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' } | Select-Object -First 1
+            }
+          }
+
+          function Get-NextCalVerVersion {
+            param(
+              [string]$LatestTag
+            )
+
+            $today = Get-Date -Format "yyyy.MM.dd"
+
+            if ($null -eq $LatestTag -or [string]::IsNullOrWhiteSpace($LatestTag)) {
+              return "$today.0"
+            }
+
+            # Extract date and patch from latest tag (format: vYYYY.MM.DD.PATCH)
+            if ($LatestTag -match '^v(\d{4}\.\d{2}\.\d{2})\.(\d+)$') {
+              $latestDate = $Matches[1]
+              $latestPatch = [int]$Matches[2]
+
+              if ($latestDate -eq $today) {
+                # Same day: increment patch number
+                $nextPatch = $latestPatch + 1
+                return "$today.$nextPatch"
+              }
+              else {
+                # New day: reset patch to 0
+                return "$today.0"
+              }
+            }
+
+            return "$today.0"
+          }
+
+          function Get-ReleaseStateDigit {
+            param(
+              [Parameter(Mandatory = $true)]
+              [psobject]$Lookup,
+              [Parameter(Mandatory = $true)]
+              [string]$StageName
+            )
+
+            $normalizedStage = $StageName.Trim().ToLowerInvariant()
+            if ($normalizedStage -eq 'production') {
+              $normalizedStage = 'release'
+            }
+
+            foreach ($entry in $Lookup.PSObject.Properties) {
+              $stateName = [string]$entry.Value
+              if ($stateName.Trim().ToLowerInvariant() -eq $normalizedStage) {
+                return [int]$entry.Name
+              }
+            }
+
+            throw "Release stage '$StageName' does not exist in release state lookup file '$($env:RELEASE_STATE_LOOKUP_FILE)'."
+          }
+
+          function New-VersionLookupCode {
+            param(
+              [Parameter(Mandatory = $true)]
+              [int]$ServicePackPosition,
+              [Parameter(Mandatory = $true)]
+              [int]$ReleaseStagePosition,
+              [Parameter(Mandatory = $true)]
+              [int]$ServicePackDigit,
+              [Parameter(Mandatory = $true)]
+              [int]$ReleaseStageDigit
+            )
+
+            if ($ServicePackPosition -eq $ReleaseStagePosition) {
+              throw "versioningPolicy.<method>.digitPositions.servicePack and releaseStage must use different positions."
+            }
+
+            $digits = @('0', '0', '0', '0', '0', '0', '0', '0', '0', '0')
+            $digits[$ServicePackPosition] = [string]$ServicePackDigit
+            $digits[$ReleaseStagePosition] = [string]$ReleaseStageDigit
+
+            return ($digits -join '')
+          }
+
+          function Ensure-YamlSupport {
+            if (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue) {
+              Write-Host 'ConvertFrom-Yaml is already available on runner.'
+              return $true
+            }
+
+            Write-Host 'ConvertFrom-Yaml not found; attempting module bootstrap for powershell-yaml.'
+
+            try {
+              if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
+                Write-Host 'NuGet provider missing. Installing NuGet provider.'
+                Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser -ErrorAction Stop
+              }
+              else {
+                Write-Host 'NuGet provider already available.'
+              }
+            }
+            catch {
+              Write-Host "NuGet provider setup failed: $($_.Exception.Message)"
+              return $false
+            }
+
+            try {
+              if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+                Write-Host 'PSGallery repository missing. Registering default repository.'
+                Register-PSRepository -Default -ErrorAction Stop
+              }
+              else {
+                Write-Host 'PSGallery repository already registered.'
+              }
+            }
+            catch {
+              Write-Host "PSGallery registration failed: $($_.Exception.Message)"
+              return $false
+            }
+
+            try {
+              Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
+              Write-Host 'PSGallery repository set to Trusted.'
+            }
+            catch {
+              Write-Host "PSGallery trust configuration failed: $($_.Exception.Message)"
+              return $false
+            }
+
+            $attempts = 3
+            for ($attempt = 1; $attempt -le $attempts; $attempt += 1) {
+              try {
+                Write-Host "Installing/importing powershell-yaml (attempt $attempt/$attempts)."
+                Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+                Import-Module powershell-yaml -ErrorAction Stop
+                if (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue) {
+                  Write-Host 'powershell-yaml loaded successfully.'
+                  return $true
+                }
+
+                Write-Host 'powershell-yaml imported but ConvertFrom-Yaml is still unavailable.'
+              }
+              catch {
+                Write-Host "Module bootstrap attempt $attempt failed: $($_.Exception.Message)"
+                if ($attempt -lt $attempts) {
+                  Write-Host 'Retrying module bootstrap.'
+                }
+              }
+            }
+
+            Write-Host 'Module bootstrap exhausted. Falling back to deterministic YAML parser.'
+            return $false
+          }
+
+          try {
+            $targetSha = $env:TARGET_SHA
+            if ([string]::IsNullOrWhiteSpace($targetSha)) {
+              throw "Unable to resolve target SHA for release tag creation."
+            }
+
+            if (-not (Test-Path $env:PIPELINE_CONFIG_FILE)) {
+              throw "Required pipeline config '$($env:PIPELINE_CONFIG_FILE)' is missing."
+            }
+
+            $yamlSupported = Ensure-YamlSupport
+
+            $pipelineConfig = Read-YamlConfig -Path $env:PIPELINE_CONFIG_FILE -ConfigName 'pipeline config' -FallbackParser ${function:Parse-PipelineVersioningPolicyFallback} -CanUseConvertFromYaml $yamlSupported
+            $versioningPolicy = $pipelineConfig.versioningPolicy
+            if ($null -eq $versioningPolicy) {
+              throw "Pipeline config '$($env:PIPELINE_CONFIG_FILE)' must define 'versioningPolicy'."
+            }
+
+            # Determine versioning method (defaults to semver for backward compatibility)
+            $versioningMethod = [string]$versioningPolicy.method
+            if ([string]::IsNullOrWhiteSpace($versioningMethod)) {
+              $versioningMethod = 'semver'
+            }
+
+            if ($versioningMethod -notin @('semver', 'calver')) {
+              throw "versioningPolicy.method must be 'semver' or 'calver', got '$versioningMethod'."
+            }
+
+            if (-not (Test-Path $env:RELEASE_STATE_LOOKUP_FILE)) {
+              throw "Required release state lookup file '$($env:RELEASE_STATE_LOOKUP_FILE)' is missing."
+            }
+
+            $releaseStateLookupDocument = Get-Content -Path $env:RELEASE_STATE_LOOKUP_FILE -Raw | ConvertFrom-Json -ErrorAction Stop
+            if ($null -eq $releaseStateLookupDocument.releaseStateLookup) {
+              throw "Release state lookup file '$($env:RELEASE_STATE_LOOKUP_FILE)' must define 'releaseStateLookup'."
+            }
+
+            $releaseStateLookup = $releaseStateLookupDocument.releaseStateLookup
+
+            # Validate initial version format based on method
+            if ($versioningMethod -eq 'semver') {
+              $methodConfig = $versioningPolicy.semver
+              if ($null -eq $methodConfig) {
+                throw "versioningPolicy.semver must be configured when method is 'semver'."
+              }
+
+              $initialVersion = [string]$methodConfig.initialVersion
+              if ([string]::IsNullOrWhiteSpace($initialVersion)) {
+                throw "versioningPolicy.semver.initialVersion must be specified."
+              }
+
+              if ($initialVersion -notmatch '^\d+\.\d+\.\d+$') {
+                throw "versioningPolicy.semver.initialVersion must use semantic version format MAJOR.MINOR.PATCH."
+              }
+
+              $defaultIncrement = [string]$methodConfig.defaultIncrement
+              $allowedIncrements = @('major', 'minor', 'patch')
+              if ($defaultIncrement -notin $allowedIncrements) {
+                throw "versioningPolicy.semver.defaultIncrement must be one of: $($allowedIncrements -join ', ')."
+              }
+            }
+            else {
+              $methodConfig = $versioningPolicy.calver
+              if ($null -eq $methodConfig) {
+                throw "versioningPolicy.calver must be configured when method is 'calver'."
+              }
+
+              $initialVersion = [string]$methodConfig.initialVersion
+              if ([string]::IsNullOrWhiteSpace($initialVersion)) {
+                throw "versioningPolicy.calver.initialVersion must be specified."
+              }
+
+              if ($initialVersion -notmatch '^\d{4}\.\d{2}\.\d{2}\.\d+$') {
+                throw "versioningPolicy.calver.initialVersion must use calendar version format YYYY.MM.DD.PATCH."
+              }
+            }
+
+            $prLabels = @()
+            if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+              if (Test-Path $env:GITHUB_EVENT_PATH) {
+                $eventPayload = Get-Content -Path $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json -ErrorAction Stop
+                if ($null -ne $eventPayload.pull_request -and $null -ne $eventPayload.pull_request.labels) {
+                  $prLabels = @($eventPayload.pull_request.labels | ForEach-Object { [string]$_.name })
+                }
+              }
+              elseif (-not [string]::IsNullOrWhiteSpace($env:PR_LABELS_JSON)) {
+                $prLabels = @((ConvertFrom-Json -InputObject $env:PR_LABELS_JSON))
+              }
+            }
+
+            # Select appropriate label overrides based on versioning method
+            if ($versioningMethod -eq 'calver') {
+              $labelOverridesConfig = $methodConfig.labelOverrides
+              $relevantIncrements = @('patch')
+            }
+            else {
+              $labelOverridesConfig = $methodConfig.labelOverrides
+              $relevantIncrements = @('major', 'minor', 'patch')
+            }
+
+            $matchedIncrements = New-Object System.Collections.Generic.List[string]
+            foreach ($increment in $relevantIncrements) {
+              $configuredLabels = @()
+              if ($null -ne $labelOverridesConfig -and $null -ne $labelOverridesConfig.$increment) {
+                $configuredLabels = @($labelOverridesConfig.$increment)
+              }
+
+              if ($configuredLabels.Count -gt 0) {
+                foreach ($label in $configuredLabels) {
+                  if ($prLabels -contains $label) {
+                    $matchedIncrements.Add($increment)
+                    break
+                  }
+                }
+              }
+            }
+
+            $distinctMatches = @($matchedIncrements | Select-Object -Unique)
+            if ($distinctMatches.Count -gt 1) {
+              throw "Conflicting version increment labels detected on PR: $($distinctMatches -join ', ')."
+            }
+
+            if ($versioningMethod -eq 'calver') {
+              $selectedIncrement = if ($distinctMatches.Count -eq 1) { $distinctMatches[0] } else { 'patch' }
+            }
+            else {
+              $selectedIncrement = if ($distinctMatches.Count -eq 1) { $distinctMatches[0] } else { $defaultIncrement }
+            }
+
+            if ($null -eq $methodConfig.digitPositions) {
+              throw "versioningPolicy.$versioningMethod.digitPositions must be configured."
+            }
+
+            $servicePackPosition = [int]$methodConfig.digitPositions.servicePack
+            $releaseStagePosition = [int]$methodConfig.digitPositions.releaseStage
+
+            $servicePackDigit = 0
+            if ($null -ne $methodConfig.servicePackDigit -and [string]::IsNullOrWhiteSpace([string]$methodConfig.servicePackDigit) -eq $false) {
+              $servicePackDigit = [int]$methodConfig.servicePackDigit
+            }
+
+            if ($servicePackPosition -lt 0 -or $servicePackPosition -gt 9) {
+              throw "versioningPolicy.$versioningMethod.digitPositions.servicePack must be a single-digit position from 0 to 9."
+            }
+
+            if ($releaseStagePosition -lt 0 -or $releaseStagePosition -gt 9) {
+              throw "versioningPolicy.$versioningMethod.digitPositions.releaseStage must be a single-digit position from 0 to 9."
+            }
+
+            if ($servicePackDigit -lt 0 -or $servicePackDigit -gt 9) {
+              throw "versioningPolicy.$versioningMethod.servicePackDigit must be a single digit from 0 to 9."
+            }
+
+            $existingStableTag = Get-StableReleaseTagForCommit -CommitSha $targetSha -VersioningMethod $versioningMethod
+            if ($existingStableTag) {
+              throw "Immutable release policy violation: commit $targetSha already has release tag '$existingStableTag'. Reusing release tags is not allowed."
+            }
+
+            # Calculate next version based on versioning method
+            if ($versioningMethod -eq 'calver') {
+              $stableTags = @(git tag --list 'v*' | Where-Object { $_ -match '^v\d{4}\.\d{2}\.\d{2}\.\d+$' })
+              $latestTag = $null
+
+              if ($stableTags.Count -gt 0) {
+                # Find most recent CalVer tag by date, then patch
+                $sorted = $stableTags | Sort-Object {
+                  if ($_ -match '^v(\d{4})\.(\d{2})\.(\d{2})\.(\d+)$') {
+                    [datetime]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3]).ToString('yyyyMMdd') + $Matches[4].PadLeft(10, '0')
+                  }
+                }
+                $latestTag = $sorted[-1]
+              }
+
+              $nextVersion = Get-NextCalVerVersion -LatestTag $latestTag
+              $baseTag = "v$nextVersion"
+              Write-Host "CalVer version calculation: latestTag=$latestTag, nextVersion=$nextVersion"
+            }
+            else {
+              $stableTags = @(git tag --list 'v*' | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' })
+              $latestVersion = $null
+              foreach ($tag in $stableTags) {
+                $versionText = $tag.Substring(1)
+                $version = [version]$versionText
+                if ($null -eq $latestVersion -or $version -gt $latestVersion) {
+                  $latestVersion = $version
+                }
+              }
+
+              if ($null -eq $latestVersion) {
+                $nextVersion = [version]$initialVersion
+              }
+              else {
+                switch ($selectedIncrement) {
+                  'major' {
+                    $nextVersion = [version]::new($latestVersion.Major + 1, 0, 0)
+                  }
+                  'minor' {
+                    $nextVersion = [version]::new($latestVersion.Major, $latestVersion.Minor + 1, 0)
+                  }
+                  default {
+                    $nextVersion = [version]::new($latestVersion.Major, $latestVersion.Minor, $latestVersion.Build + 1)
+                  }
+                }
+              }
+
+              $baseTag = "v$($nextVersion.Major).$($nextVersion.Minor).$($nextVersion.Build)"
+            }
+
+            $nextTag = $baseTag
+            $resolvedStage = 'production'
+
+            if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+              $manualStage = ([string]$env:MANUAL_RELEASE_STAGE).Trim().ToLowerInvariant()
+
+              if ([string]::IsNullOrWhiteSpace($manualStage) -or $manualStage -eq 'config') {
+                if (Test-Path $env:MANUAL_RELEASE_CONFIG_FILE) {
+                  $manualConfig = Read-YamlConfig -Path $env:MANUAL_RELEASE_CONFIG_FILE -ConfigName 'manual release config' -FallbackParser ${function:Parse-ManualReleaseConfigFallback} -CanUseConvertFromYaml $yamlSupported
+                  if ([string]::IsNullOrWhiteSpace([string]$manualConfig.defaultManualStage) -eq $false) {
+                    $manualStage = ([string]$manualConfig.defaultManualStage).Trim().ToLowerInvariant()
+                  }
+                }
+              }
+
+              if ([string]::IsNullOrWhiteSpace($manualStage)) {
+                $manualStage = 'production'
+              }
+
+              $resolvedStage = $manualStage
+
+              if ($manualStage -notin @('production', 'alpha', 'beta', 'rc')) {
+                throw "Invalid manual release stage '$manualStage'. Allowed values: production, alpha, beta, rc."
+              }
+
+              if ($manualStage -ne 'production') {
+                $preReleaseTags = @(git tag --list "$baseTag-$manualStage.*")
+                $nextPreReleaseNumber = 1
+                foreach ($tag in $preReleaseTags) {
+                  if ($tag -match "^$([regex]::Escape($baseTag))-$manualStage\.(\d+)$") {
+                    $value = [int]$Matches[1]
+                    if ($value -ge $nextPreReleaseNumber) {
+                      $nextPreReleaseNumber = $value + 1
+                    }
+                  }
+                }
+
+                $nextTag = "$baseTag-$manualStage.$nextPreReleaseNumber"
+              }
+            }
+
+            $releaseStageDigit = Get-ReleaseStateDigit -Lookup $releaseStateLookup -StageName $resolvedStage
+            $versionLookupCode = New-VersionLookupCode -ServicePackPosition $servicePackPosition -ReleaseStagePosition $releaseStagePosition -ServicePackDigit $servicePackDigit -ReleaseStageDigit $releaseStageDigit
+            $numericVersionValues = [int]("$servicePackDigit$releaseStageDigit")
+            $numericVersionTag = "$nextTag.$servicePackDigit.$releaseStageDigit"
+
+            if (Test-GitTagExists -TagName $nextTag) {
+              throw "Immutable release policy violation: release tag '$nextTag' already exists. Reusing existing release tags is not allowed."
+            }
+
+            "tag_already_exists=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "resolved_tag=$nextTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "selected_increment=$selectedIncrement" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "version_lookup_code=$versionLookupCode" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "service_pack_digit=$servicePackDigit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "release_stage_digit=$releaseStageDigit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "numeric_version_values=$numericVersionValues" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+            @(
+              "## Release Versioning"
+              "- Versioning method: $versioningMethod"
+              "- Selected increment: $selectedIncrement"
+              "- Service pack digit: $servicePackDigit"
+              "- Release stage digit: $releaseStageDigit"
+              "- Numeric value (integer): $numericVersionValues"
+              "- Resolved stage: $resolvedStage"
+              "- Version lookup code: $versionLookupCode"
+              "- Canonical tag: $nextTag"
+              "- Numeric version tag: $numericVersionTag"
+            ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+          catch {
+            $errorMessage = $_.Exception.Message
+            $errorDetails = $_ | Out-String
+            Write-Host "::error::Release tag resolution failed: $errorMessage"
+            Write-Host "Detailed error context:"
+            Write-Host $errorDetails
+            throw
+          }
+
+      - name: Create release tag from merged PR commit
+        if: steps.versioning.outputs.tag_already_exists != 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const targetSha = context.eventName === 'pull_request'
+              ? context.payload.pull_request.merge_commit_sha
+              : context.sha;
+            const canonicalTag = `${{ steps.versioning.outputs.resolved_tag }}`;
+
+            // Create canonical tag (SemVer/CalVer compliant)
+            await github.rest.git.createRef({
+              owner,
+              repo,
+              ref: `refs/tags/${canonicalTag}`,
+              sha: targetSha
+            });
+            core.info(`Created canonical release tag '${canonicalTag}' for commit ${targetSha}.`);
+
+  prepare-release:
+    needs:
+      - validate-repo-structure
+      - spell-check
+      - markdownlint
+      - verify-authoritative-ci
+      - create-release-tag
+      - detect-stage
+    if: >
+      (github.event_name != 'pull_request' ||
+       (github.event.action == 'closed' &&
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.base.ref == 'main')) &&
+      (github.event_name != 'pull_request' ||
+       (github.event.pull_request.merged == true &&
+        github.event.pull_request.base.ref == 'main' &&
+        !startsWith(github.event.pull_request.head.ref, 'automation/changelog-')))
+    runs-on: windows-2022
+    outputs:
+      has_powershell: ${{ steps.detect.outputs.has_powershell }}
+      has_dotnet: ${{ steps.detect.outputs.has_dotnet }}
+      has_python: ${{ steps.detect.outputs.has_python }}
+      package_name: ${{ steps.archive.outputs.package_name }}
+
+    # Declare one env entry per secretEnvVar value used in powershellPublishTargets,
+    # nugetPublishTargets, pythonPublishTargets, and sharePointTargets in pipeline-config/ref/publish-targets.yaml.
+    # GitHub Actions cannot resolve secrets dynamically, so each must be listed explicitly.
+    # If a secret is not configured in the repository the variable resolves to an empty
+    # string and the corresponding publish step will skip with a warning.
+    env:
+      RELEASE_STAGE: ${{ needs.detect-stage.outputs.stage }}
+      RELEASE_TAG: ${{ needs.create-release-tag.outputs.release_tag || github.ref_name }}
+      VERSION_LOOKUP_CODE: ${{ needs.create-release-tag.outputs.version_lookup_code }}
+      SERVICE_PACK_DIGIT: ${{ needs.create-release-tag.outputs.service_pack_digit }}
+      RELEASE_STAGE_DIGIT: ${{ needs.create-release-tag.outputs.release_stage_digit }}
+      NUMERIC_VERSION_VALUES: ${{ needs.create-release-tag.outputs.numeric_version_values }}
+      CODESIGN_AZURE_CLIENT_ID: ${{ secrets.CODESIGN_AZURE_CLIENT_ID }}
+      CODESIGN_AZURE_TENANT_ID: ${{ secrets.CODESIGN_AZURE_TENANT_ID }}
+      CODESIGN_AZURE_SUBSCRIPTION_ID: ${{ secrets.CODESIGN_AZURE_SUBSCRIPTION_ID }}
+      CODESIGN_AZURE_KEYVAULT_NAME: ${{ secrets.CODESIGN_AZURE_KEYVAULT_NAME }}
+      CODESIGN_AZURE_KEYVAULT_CERT_NAME: ${{ secrets.CODESIGN_AZURE_KEYVAULT_CERT_NAME }}
+      CODESIGN_AZURE_KEYVAULT_CERT_PASSWORD_SECRET_NAME: ${{ secrets.CODESIGN_AZURE_KEYVAULT_CERT_PASSWORD_SECRET_NAME }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Detect repository language content
+        id: detect
+        shell: pwsh
+        run: |
+          $hasPowerShell = @((Get-ChildItem -Path . -Recurse -File -Include *.ps1,*.psm1,*.psd1 -ErrorAction SilentlyContinue)).Count -gt 0
+          $hasDotNet = @((Get-ChildItem -Path . -Recurse -File -Include *.sln,*.csproj -ErrorAction SilentlyContinue)).Count -gt 0
+          $hasPython = @((Get-ChildItem -Path . -Recurse -File -Include *.py -ErrorAction SilentlyContinue)).Count -gt 0
+
+          "has_powershell=$hasPowerShell" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "has_dotnet=$hasDotNet" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "has_python=$hasPython" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Summarize effective release configuration
+        shell: pwsh
+        run: |
+          $publishTargetsFile = "${{ env.PUBLISH_TARGETS_FILE }}"
+          $currentStage = "$env:RELEASE_STAGE"
+
+          $psTargets = @()
+          $nugetTargets = @()
+          $pythonTargets = @()
+          $sharePointTargets = @()
+          $sharePointEnabled = $true
+
+          if (Test-Path $publishTargetsFile) {
+            if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+              if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+                Register-PSRepository -Default -ErrorAction Stop
+              }
+              Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+              Import-Module powershell-yaml -ErrorAction Stop
+            }
+
+            $publishConfig = Get-Content -Path $publishTargetsFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+
+            if ($null -ne $publishConfig.sharePointPublishing -and $null -ne $publishConfig.sharePointPublishing.enabled) {
+              $rawSharePointEnabled = $publishConfig.sharePointPublishing.enabled
+              if ($rawSharePointEnabled -is [bool]) {
+                $sharePointEnabled = [bool]$rawSharePointEnabled
+              }
+              else {
+                $normalizedEnabled = ([string]$rawSharePointEnabled).Trim().ToLowerInvariant()
+                if ($normalizedEnabled -in @('true', '1', 'yes', 'on')) {
+                  $sharePointEnabled = $true
+                }
+                elseif ($normalizedEnabled -in @('false', '0', 'no', 'off')) {
+                  $sharePointEnabled = $false
+                }
+                else {
+                  throw "Invalid sharePointPublishing.enabled value '$rawSharePointEnabled'. Use true or false."
+                }
+              }
+            }
+
+            if ($null -ne $publishConfig.powershellPublishTargets) {
+              $psTargets = @($publishConfig.powershellPublishTargets | Where-Object {
+                $null -eq $_.stages -or $_.stages.Count -eq 0 -or $currentStage -in $_.stages
+              })
+            }
+
+            if ($null -ne $publishConfig.nugetPublishTargets) {
+              $nugetTargets = @($publishConfig.nugetPublishTargets | Where-Object {
+                $null -eq $_.stages -or $_.stages.Count -eq 0 -or $currentStage -in $_.stages
+              })
+            }
+
+            if ($null -ne $publishConfig.pythonPublishTargets) {
+              $pythonTargets = @($publishConfig.pythonPublishTargets | Where-Object {
+                $null -eq $_.stages -or $_.stages.Count -eq 0 -or $currentStage -in $_.stages
+              })
+            }
+
+            if ($sharePointEnabled -and $null -ne $publishConfig.sharePointTargets) {
+              $sharePointTargets = @($publishConfig.sharePointTargets | Where-Object {
+                $targetEnabled = $true
+                if ($null -ne $_.enabled) {
+                  if ($_.enabled -is [bool]) {
+                    $targetEnabled = [bool]$_.enabled
+                  }
+                  else {
+                    $normalizedTargetEnabled = ([string]$_.enabled).Trim().ToLowerInvariant()
+                    if ($normalizedTargetEnabled -in @('true', '1', 'yes', 'on')) {
+                      $targetEnabled = $true
+                    }
+                    elseif ($normalizedTargetEnabled -in @('false', '0', 'no', 'off')) {
+                      $targetEnabled = $false
+                    }
+                    else {
+                      throw "Invalid sharePointTargets.enabled value '$($_.enabled)' for target '$($_.name)'. Use true or false."
+                    }
+                  }
+                }
+
+                $targetEnabled
+              })
+            }
+          }
+
+          $psNames = if ($psTargets.Count -gt 0) { ($psTargets | ForEach-Object { $_.name }) -join ', ' } else { 'none' }
+          $nugetNames = if ($nugetTargets.Count -gt 0) { ($nugetTargets | ForEach-Object { $_.name }) -join ', ' } else { 'none' }
+          $pythonNames = if ($pythonTargets.Count -gt 0) { ($pythonTargets | ForEach-Object { $_.name }) -join ', ' } else { 'none' }
+          $sharePointNames = if ($sharePointTargets.Count -gt 0) { ($sharePointTargets | ForEach-Object { $_.name }) -join ', ' } else { 'none' }
+
+          @(
+            '## Effective Release Configuration'
+            '- Stage: ' + $currentStage
+            '- Canonical release tag: ' + "$env:RELEASE_TAG"
+            '- Service pack digit: ' + "$env:SERVICE_PACK_DIGIT"
+            '- Release stage digit: ' + "$env:RELEASE_STAGE_DIGIT"
+            '- Numeric value (integer): ' + "$env:NUMERIC_VERSION_VALUES"
+            '- Version lookup code: ' + "$env:VERSION_LOOKUP_CODE"
+            '- PowerShell detected: ${{ steps.detect.outputs.has_powershell }}'
+            '- .NET detected: ${{ steps.detect.outputs.has_dotnet }}'
+            '- Python detected: ${{ steps.detect.outputs.has_python }}'
+            '- PowerShell targets (filtered): ' + $psNames
+            '- NuGet targets (filtered): ' + $nugetNames
+            '- Python targets (filtered): ' + $pythonNames
+            '- SharePoint publishing enabled: ' + $sharePointEnabled
+            '- SharePoint targets (enabled): ' + $sharePointNames
+            '- Secrets are intentionally not printed in this summary.'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v5
+        with:
+          node-version: latest
+
+      - name: Setup PowerShell tools
+        uses: ./.github/actions/setup-powershell-tools
+        with:
+          dependency-file: ${{ env.POWERSHELL_TOOLS_FILE }}
+
+      - name: Setup .NET SDK
+        if: steps.detect.outputs.has_dotnet == 'True'
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '9.0.x'
+          cache: true
+
+      - name: Setup Python
+        if: steps.detect.outputs.has_python == 'True'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Resolve dependency repositories from config
+        id: dependency_repos
+        shell: pwsh
+        run: |
+          $dependencyFile = "${{ env.PKG_DEPENDENCY_REFERENCE_FILE }}"
+
+          if (-not (Test-Path $dependencyFile)) {
+            throw "Required package dependency file '$dependencyFile' is missing."
+          }
+
+          $dependencyContent = Get-Content -Path $dependencyFile -Raw
+          $dependencyConfig = $null
+          $canUseYamlCmdlet = $false
+
+          if (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue) {
+            try {
+              $dependencyConfig = $dependencyContent | ConvertFrom-Yaml -ErrorAction Stop
+              $canUseYamlCmdlet = $true
+            }
+            catch {
+              Write-Warning "ConvertFrom-Yaml exists but failed to parse '$dependencyFile': $($_.Exception.Message)"
+            }
+          }
+          else {
+            try {
+              if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+                Register-PSRepository -Default -ErrorAction Stop
+              }
+
+              Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+              Import-Module powershell-yaml -ErrorAction Stop
+              $dependencyConfig = $dependencyContent | ConvertFrom-Yaml -ErrorAction Stop
+              $canUseYamlCmdlet = $true
+            }
+            catch {
+              Write-Warning "Unable to install powershell-yaml from PSGallery. Falling back to regex parsing for repository names. Error: $($_.Exception.Message)"
+            }
+          }
+
+          $repositoryNames = @()
+
+          if ($canUseYamlCmdlet -and $null -ne $dependencyConfig) {
+            foreach ($sectionName in @('powershellRepositories', 'dotnetReleaseRepositories', 'pythonReleaseRepositories')) {
+              $sectionEntries = @($dependencyConfig.$sectionName)
+              foreach ($entry in $sectionEntries) {
+                if (-not [string]::IsNullOrWhiteSpace($entry.name)) {
+                  $repositoryNames += [string]$entry.name
+                }
+              }
+            }
+          }
+          else {
+            $targetSections = @('powershellRepositories', 'dotnetReleaseRepositories', 'pythonReleaseRepositories')
+            $currentSection = ''
+
+            foreach ($line in ($dependencyContent -split "`r?`n")) {
+              if ($line -match '^\s*#') {
+                continue
+              }
+
+              if ($line -match '^(\w+)\s*:') {
+                $candidateSection = [string]$matches[1]
+                if ($targetSections -contains $candidateSection) {
+                  $currentSection = $candidateSection
+                }
+                else {
+                  $currentSection = ''
+                }
+                continue
+              }
+
+              if ([string]::IsNullOrWhiteSpace($currentSection)) {
+                continue
+              }
+
+              if ($line -match '^\s*-\s*name\s*:\s*(.+?)\s*$') {
+                $nameValue = [string]$matches[1]
+                $nameValue = $nameValue -replace '\s+#.*$', ''
+                $nameValue = $nameValue.Trim().Trim('"').Trim("'")
+                if (-not [string]::IsNullOrWhiteSpace($nameValue)) {
+                  $repositoryNames += $nameValue
+                }
+              }
+            }
+          }
+
+          $repositoryNames = @($repositoryNames | Sort-Object -Unique)
+          if ($repositoryNames.Count -eq 0) {
+            @(
+              'has_dependencies=false'
+              'repositories='
+            ) | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+            @(
+              '## Dependency Repositories'
+              "- Config file: $dependencyFile"
+              '- Status: no dependency repositories configured; dependency-specific release steps will be skipped.'
+            ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+            exit 0
+          }
+
+          @(
+            'has_dependencies=true'
+            'repositories<<EOF'
+            ($repositoryNames -join "`n")
+            'EOF'
+          ) | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          @(
+            '## Dependency Repositories'
+            "- Config file: $dependencyFile"
+            "- Resolved repositories: $($repositoryNames -join ', ')"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Create dependency repository app token
+        if: steps.dependency_repos.outputs.has_dependencies == 'true'
+        id: dependency_app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DEPENDENCY_APP_ID }}
+          private-key: ${{ secrets.DEPENDENCY_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ steps.dependency_repos.outputs.repositories }}
+
+      - name: Diagnose dependency repository token access
+        if: github.event_name == 'workflow_dispatch' && inputs.debug_dependency_access && steps.dependency_repos.outputs.has_dependencies == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.dependency_app_token.outputs.token }}
+        run: |
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+            Authorization = "token $env:GH_TOKEN"
+          }
+
+          function Get-EndpointStatus {
+            param([string]$Uri)
+
+            try {
+              Invoke-RestMethod -Method Get -Headers $headers -Uri $Uri -ErrorAction Stop | Out-Null
+              return 200
+            }
+            catch {
+              if ($null -ne $_.Exception.Response -and $null -ne $_.Exception.Response.StatusCode) {
+                return [int]$_.Exception.Response.StatusCode
+              }
+
+              throw
+            }
+          }
+
+          $dependencyFile = "${{ env.PKG_DEPENDENCY_REFERENCE_FILE }}"
+          if (-not (Test-Path $dependencyFile)) {
+            throw "Required package dependency file '$dependencyFile' is missing."
+          }
+
+          if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+            if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+              Register-PSRepository -Default -ErrorAction Stop
+            }
+
+            Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            Import-Module powershell-yaml -ErrorAction Stop
+          }
+
+          $dependencyConfig = Get-Content -Path $dependencyFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+          $targets = @()
+
+          foreach ($sectionName in @('powershellRepositories', 'dotnetReleaseRepositories', 'pythonReleaseRepositories')) {
+            $sectionEntries = @($dependencyConfig.$sectionName)
+            foreach ($entry in $sectionEntries) {
+              if ([string]::IsNullOrWhiteSpace($entry.name) -or [string]::IsNullOrWhiteSpace($entry.sourceLocation)) {
+                continue
+              }
+
+              $uri = [System.Uri]::new([string]$entry.sourceLocation)
+              if ($uri.Host -ne 'github.com') {
+                continue
+              }
+
+              $segments = @($uri.AbsolutePath.Trim('/').Split('/'))
+              if ($segments.Count -lt 2) {
+                continue
+              }
+
+              $targets += @{
+                Name = [string]$entry.name
+                Repo = "$($segments[0])/$($segments[1])"
+              }
+            }
+          }
+
+          $targets = @($targets | Sort-Object Name -Unique)
+
+          foreach ($target in $targets) {
+            $repoStatus = Get-EndpointStatus -Uri "https://api.github.com/repos/$($target.Repo)"
+            $releaseStatus = Get-EndpointStatus -Uri "https://api.github.com/repos/$($target.Repo)/releases/latest"
+            Write-Host "$($target.Name): repo endpoint status=$repoStatus; latest release endpoint status=$releaseStatus"
+          }
+
+      - name: Configure NuGet sources from dependency file
+        if: steps.detect.outputs.has_dotnet == 'True'
+        shell: pwsh
+        run: |
+          $dependencyFile = "${{ env.TEST_DEPENDENCY_REFERENCE_FILE }}"
+          if (-not (Test-Path $dependencyFile)) {
+            Write-Host "Dependency file '$dependencyFile' not found. Using default NuGet sources."
+            exit 0
+          }
+
+          if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+            if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+              Register-PSRepository -Default -ErrorAction Stop
+            }
+            Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            Import-Module powershell-yaml -ErrorAction Stop
+          }
+
+          $dependencyConfig = Get-Content -Path $dependencyFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+          $nugetSources = @()
+          if ($null -ne $dependencyConfig.nugetSources) {
+            $nugetSources = @($dependencyConfig.nugetSources)
+          }
+
+          foreach ($source in $nugetSources) {
+            $sourceName = $source.name
+            $sourceUrl = $source.url
+            if ([string]::IsNullOrWhiteSpace($sourceName) -or [string]::IsNullOrWhiteSpace($sourceUrl)) {
+              throw "Each nugetSources entry must include 'name' and 'url'."
+            }
+
+            try {
+              dotnet nuget add source $sourceUrl --name $sourceName
+              Write-Host "Added NuGet source '$sourceName' ($sourceUrl)."
+            }
+            catch {
+              dotnet nuget update source $sourceName --source $sourceUrl
+              Write-Host "Updated NuGet source '$sourceName' ($sourceUrl)."
+            }
+          }
+
+      - name: Build and test .NET
+        if: steps.detect.outputs.has_dotnet == 'True'
+        shell: pwsh
+        run: |
+          dotnet restore
+          dotnet build --configuration Release --no-restore
+          dotnet test --configuration Release --no-build
+
+      - name: Publish .NET outputs
+        if: steps.detect.outputs.has_dotnet == 'True'
+        shell: pwsh
+        run: |
+          $projects = Get-ChildItem -Path . -Recurse -File -Filter *.csproj
+          if (-not $projects) {
+            Write-Host "No .csproj files found for publish."
+            exit 0
+          }
+
+          foreach ($project in $projects) {
+            $name = [System.IO.Path]::GetFileNameWithoutExtension($project.Name)
+            $outputPath = "out/dotnet/$name"
+            dotnet publish $project.FullName --configuration Release --no-build --output $outputPath
+          }
+
+      - name: Configure Python indexes from dependency file
+        if: steps.detect.outputs.has_python == 'True'
+        shell: pwsh
+        run: |
+          $dependencyFile = "${{ env.TEST_DEPENDENCY_REFERENCE_FILE }}"
+          $extraIndexArgs = @()
+
+          if (Test-Path $dependencyFile) {
+          if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+              if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+                Register-PSRepository -Default -ErrorAction Stop
+              }
+              Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+              Import-Module powershell-yaml -ErrorAction Stop
+            }
+
+            $dependencyConfig = Get-Content -Path $dependencyFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+            $pythonIndexes = @()
+            if ($null -ne $dependencyConfig.pythonIndexes) {
+              $pythonIndexes = @($dependencyConfig.pythonIndexes)
+            }
+
+            foreach ($index in $pythonIndexes) {
+              if ([string]::IsNullOrWhiteSpace($index.url) -eq $false) {
+                $extraIndexArgs += @("--extra-index-url", $index.url)
+              }
+            }
+          }
+
+          python -m pip install --upgrade pip
+
+          # Build tool package list from dependency file if available, otherwise use defaults.
+          # Entries with version "latest" or no version stage the newest available release assets.
+          # Entries with a specific version (e.g. "1.2.0") install that exact release.
+          $pipTools = @()
+          if ($null -ne $dependencyConfig -and $null -ne $dependencyConfig.pythonPackages) {
+            foreach ($pkg in @($dependencyConfig.pythonPackages)) {
+              $specifier = if ([string]::IsNullOrWhiteSpace($pkg.version) -or $pkg.version -eq 'latest') {
+                $pkg.name
+              }
+              else {
+                "$($pkg.name)==$($pkg.version)"
+              }
+              $pipTools += $specifier
+            }
+          }
+          else {
+            $pipTools = @("build", "pytest")
+          }
+          & python -m pip install @pipTools @extraIndexArgs
+
+          if (Test-Path "requirements.txt") {
+            & python -m pip install -r requirements.txt @extraIndexArgs
+          }
+          elseif (Test-Path "pyproject.toml") {
+            & python -m pip install . @extraIndexArgs
+          }
+
+      - name: Run Python tests
+        if: steps.detect.outputs.has_python == 'True'
+        shell: pwsh
+        run: |
+          if (Test-Path "pytest.ini" -or Test-Path "pyproject.toml" -or Test-Path "tests") {
+            pytest
+          }
+          else {
+            Write-Host "No Python test configuration detected, skipping tests."
+          }
+
+      - name: Build Python distributions
+        if: steps.detect.outputs.has_python == 'True'
+        shell: pwsh
+        run: |
+          if (Test-Path "pyproject.toml" -or Test-Path "setup.py") {
+            python -m build
+            New-Item -ItemType Directory -Path out/python -Force | Out-Null
+            Copy-Item -Path dist/* -Destination out/python -Force
+          }
+          else {
+            Write-Host "No Python build metadata found, skipping distribution build."
+          }
+
+      - name: Download dependency release packages
+        if: (steps.detect.outputs.has_powershell == 'True' || steps.detect.outputs.has_dotnet == 'True' || steps.detect.outputs.has_python == 'True') && steps.dependency_repos.outputs.has_dependencies == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.dependency_app_token.outputs.token }}
+        run: |
+          $dependencyFile = "${{ env.PKG_DEPENDENCY_REFERENCE_FILE }}"
+          if (-not (Test-Path $dependencyFile)) {
+            Write-Host "Package dependency file '$dependencyFile' not found. Skipping release package staging."
+            exit 0
+          }
+
+          if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+            if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+              Register-PSRepository -Default -ErrorAction Stop
+            }
+            Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            Import-Module powershell-yaml -ErrorAction Stop
+          }
+
+          function Resolve-GitHubReleaseRepositorySlug {
+            param([string]$SourceLocation)
+
+            $uri = [System.Uri]::new($SourceLocation)
+            if ($uri.Host -ne 'github.com') {
+              throw "Unsupported release package source '$SourceLocation'. Expected a GitHub release URL."
+            }
+
+            $segments = @($uri.AbsolutePath.Trim('/').Split('/'))
+            if ($segments.Count -lt 2) {
+              throw "Source location '$SourceLocation' must point to a GitHub repository release page."
+            }
+
+            return "$($segments[0])/$($segments[1])"
+          }
+
+          function Get-HttpStatusCode {
+            param([System.Exception]$Exception)
+
+            if ($null -ne $Exception -and $null -ne $Exception.Response -and $null -ne $Exception.Response.StatusCode) {
+              return [int]$Exception.Response.StatusCode
+            }
+
+            return 0
+          }
+
+          function Get-GitHubRelease {
+            param(
+              [string]$RepositorySlug,
+              [string]$TagName,
+              [string]$Token
+            )
+
+            $headers = @{
+              Accept = 'application/vnd.github+json'
+              'X-GitHub-Api-Version' = '2022-11-28'
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($Token)) {
+              $headers.Authorization = "token $Token"
+            }
+
+            if ([string]::IsNullOrWhiteSpace($TagName) -or $TagName -eq 'latest') {
+              try {
+                return Invoke-RestMethod -Method Get -Headers $headers -Uri "https://api.github.com/repos/$RepositorySlug/releases/latest" -ErrorAction Stop
+              }
+              catch {
+                $statusCode = Get-HttpStatusCode -Exception $_.Exception
+                if ($statusCode -eq 404) {
+                  throw "Package release not available for '$RepositorySlug' (requested: latest). No published release was found, or repository access is unavailable."
+                }
+
+                throw "Failed to resolve latest package release for '$RepositorySlug'. GitHub API status: $statusCode."
+              }
+            }
+
+            $candidateTags = @($TagName)
+            if (-not $TagName.StartsWith('v')) {
+              $candidateTags += "v$TagName"
+            }
+
+            $lastStatusCode = 0
+            foreach ($candidateTag in $candidateTags) {
+              try {
+                return Invoke-RestMethod -Method Get -Headers $headers -Uri "https://api.github.com/repos/$RepositorySlug/releases/tags/$candidateTag" -ErrorAction Stop
+              }
+              catch {
+                $statusCode = Get-HttpStatusCode -Exception $_.Exception
+                if ($statusCode -eq 404) {
+                  $lastStatusCode = $statusCode
+                  continue
+                }
+
+                throw "Failed to resolve package release tag '$candidateTag' for '$RepositorySlug'. GitHub API status: $statusCode."
+              }
+            }
+
+            if ($lastStatusCode -eq 404) {
+              throw "Package release version not available for '$RepositorySlug' (requested: '$TagName')."
+            }
+
+            throw "No GitHub release tag matching '$TagName' was found for '$RepositorySlug'."
+          }
+
+          function Stage-GitHubReleasePackages {
+            param(
+              [string]$RepoSection,
+              [string]$PackageSection,
+              [string]$StageRoot,
+              [string]$LogLabel,
+              [string]$Token
+            )
+
+            $repositoryEntries = @()
+            if ($null -ne $dependencyConfig.$RepoSection) {
+              $repositoryEntries = @($dependencyConfig.$RepoSection)
+            }
+
+            $packageEntries = @()
+            if ($null -ne $dependencyConfig.$PackageSection) {
+              $packageEntries = @($dependencyConfig.$PackageSection)
+            }
+
+            if ($packageEntries.Count -eq 0) {
+              Write-Host "No $PackageSection entries found in '$dependencyFile'. Skipping $LogLabel release-package staging."
+              return
+            }
+
+            if ($repositoryEntries.Count -eq 0) {
+              throw "No $RepoSection entries found in '$dependencyFile'."
+            }
+
+            $repoLookup = @{}
+            foreach ($repo in $repositoryEntries) {
+              if ([string]::IsNullOrWhiteSpace($repo.name) -or [string]::IsNullOrWhiteSpace($repo.sourceLocation)) {
+                throw "Each $RepoSection entry in '$dependencyFile' must include 'name' and 'sourceLocation'."
+              }
+
+              $repoLookup[$repo.name] = $repo
+            }
+
+            New-Item -ItemType Directory -Path $StageRoot -Force | Out-Null
+            $missingPackages = New-Object System.Collections.Generic.List[string]
+
+            foreach ($package in $packageEntries) {
+              $packageName = $package.name
+              if ([string]::IsNullOrWhiteSpace($packageName)) {
+                throw "Each $PackageSection entry in '$dependencyFile' must include 'name'."
+              }
+
+              if (-not $repoLookup.ContainsKey($packageName)) {
+                throw "No matching $RepoSection entry was found for package '$packageName'."
+              }
+
+              $repo = $repoLookup[$packageName]
+              $repoSlug = Resolve-GitHubReleaseRepositorySlug -SourceLocation $repo.sourceLocation
+              $requestedVersion = if ([string]::IsNullOrWhiteSpace($package.version) -or $package.version -eq 'latest') {
+                'latest'
+              }
+              else {
+                [string]$package.version
+              }
+
+              try {
+                $releaseTag = if ($requestedVersion -eq 'latest') {
+                  $null
+                }
+                else {
+                  $requestedVersion
+                }
+
+                $release = Get-GitHubRelease -RepositorySlug $repoSlug -TagName $releaseTag -Token $Token
+                $assets = @($release.assets)
+
+                if ($assets.Count -eq 0) {
+                  throw "Package release '$($release.tag_name)' for '$repoSlug' is available but contains no assets to stage."
+                }
+
+                $packageStageRoot = Join-Path $StageRoot $packageName
+                $releaseStageRoot = Join-Path $packageStageRoot ($release.tag_name -replace '[\\/:*?"<>|]', '_')
+                New-Item -ItemType Directory -Path $releaseStageRoot -Force | Out-Null
+
+                foreach ($asset in $assets) {
+                  $assetPath = Join-Path $releaseStageRoot $asset.name
+                  $assetHeaders = @{
+                    Accept = 'application/octet-stream'
+                    'X-GitHub-Api-Version' = '2022-11-28'
+                  }
+
+                  if (-not [string]::IsNullOrWhiteSpace($Token)) {
+                    $assetHeaders.Authorization = "token $Token"
+                  }
+
+                  try {
+                    Invoke-WebRequest -Uri $asset.url -Headers $assetHeaders -OutFile $assetPath -ErrorAction Stop
+                  }
+                  catch {
+                    throw "Failed to download release asset '$($asset.name)' from '$repoSlug'. $($_.Exception.Message)"
+                  }
+
+                  Write-Host "Downloaded release asset '$($asset.name)' for '$packageName' to '$assetPath'."
+                }
+              }
+              catch {
+                $message = "Package '$packageName' in section '$PackageSection' is missing or not available from '$repoSlug' (requested: $requestedVersion). $($_.Exception.Message)"
+                Write-Host "::warning::$message"
+                $missingPackages.Add("- $message")
+                continue
+              }
+            }
+
+            if ($missingPackages.Count -gt 0) {
+              @('### Missing or unavailable dependency release packages') + @($missingPackages) |
+                Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+              throw "One or more dependency release packages are missing or unavailable. See step summary for details."
+            }
+          }
+
+          $ghToken = $env:GH_TOKEN
+          $dependencyConfig = Get-Content -Path $dependencyFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+          Stage-GitHubReleasePackages -RepoSection 'powershellRepositories' -PackageSection 'powershellModules' -StageRoot 'release-content/powershell-packages' -LogLabel 'PowerShell' -Token $ghToken
+          Stage-GitHubReleasePackages -RepoSection 'dotnetReleaseRepositories' -PackageSection 'dotnetReleasePackages' -StageRoot 'release-content/dotnet-packages' -LogLabel '.NET' -Token $ghToken
+          Stage-GitHubReleasePackages -RepoSection 'pythonReleaseRepositories' -PackageSection 'pythonReleasePackages' -StageRoot 'release-content/python-packages' -LogLabel 'Python' -Token $ghToken
+
+      - name: Determine whether stage signing is enabled
+        id: signing_gate
+        shell: pwsh
+        env:
+          SIGNING_CONFIG_FILE: pipeline-config/ref/signing.yaml
+        run: |
+          if (-not (Test-Path $env:SIGNING_CONFIG_FILE)) {
+            "should_sign=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "Signing config '$env:SIGNING_CONFIG_FILE' not found; skipping Key Vault certificate retrieval."
+            exit 0
+          }
+
+          if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+            if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+              Register-PSRepository -Default -ErrorAction Stop
+            }
+
+            Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            Import-Module powershell-yaml -ErrorAction Stop
+          }
+
+          $signingConfig = Get-Content -Path $env:SIGNING_CONFIG_FILE -Raw | ConvertFrom-Yaml -ErrorAction Stop
+          $enabled = $false
+
+          if ($null -ne $signingConfig.enabled) {
+            if ($signingConfig.enabled -is [bool]) {
+              $enabled = [bool]$signingConfig.enabled
+            }
+            else {
+              $enabled = ([string]$signingConfig.enabled).Trim().ToLowerInvariant() -eq 'true'
+            }
+          }
+
+          if (-not $enabled) {
+            "should_sign=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "Signing is disabled in '$env:SIGNING_CONFIG_FILE'; skipping Key Vault certificate retrieval."
+            exit 0
+          }
+
+          $stagePolicy = $signingConfig.stagePolicy.$env:RELEASE_STAGE
+          if ($null -eq $stagePolicy) {
+            throw "Signing config does not define a stagePolicy entry for '$env:RELEASE_STAGE'."
+          }
+
+          $shouldSign = $false
+          if ($null -ne $stagePolicy.sign) {
+            if ($stagePolicy.sign -is [bool]) {
+              $shouldSign = [bool]$stagePolicy.sign
+            }
+            else {
+              $shouldSign = ([string]$stagePolicy.sign).Trim().ToLowerInvariant() -eq 'true'
+            }
+          }
+
+          "should_sign=$($shouldSign.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if ($shouldSign) {
+            Write-Host "Signing is enabled for stage '$env:RELEASE_STAGE'; Key Vault certificate retrieval will run."
+          }
+          else {
+            Write-Host "Signing is disabled for stage '$env:RELEASE_STAGE'; Key Vault certificate retrieval will be skipped."
+          }
+
+      - name: Azure login with OIDC for Key Vault
+        if: steps.signing_gate.outputs.should_sign == 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.CODESIGN_AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.CODESIGN_AZURE_TENANT_ID }}
+          subscription-id: ${{ env.CODESIGN_AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate Azure Key Vault configuration for signing
+        if: steps.signing_gate.outputs.should_sign == 'true'
+        shell: pwsh
+        run: |
+          $vaultName = $env:CODESIGN_AZURE_KEYVAULT_NAME
+          $certName = $env:CODESIGN_AZURE_KEYVAULT_CERT_NAME
+
+          if ([string]::IsNullOrWhiteSpace($vaultName) -or [string]::IsNullOrWhiteSpace($certName))
+          {
+              throw "Missing Azure Key Vault configuration. Set CODESIGN_AZURE_KEYVAULT_NAME and CODESIGN_AZURE_KEYVAULT_CERT_NAME."
+          }
+
+          Write-Host "Key Vault configuration validated"
+          Write-Host "  Vault: $vaultName"
+          Write-Host "  Certificate: $certName"
+          Write-Host "  Note: Private key stays in Key Vault; azureSignTool will authenticate via OIDC"
+
+      - name: Sign release inputs with azureSignTool
+        if: steps.signing_gate.outputs.should_sign == 'true'
+        shell: pwsh
+        env:
+          SIGNING_CONFIG_FILE: pipeline-config/ref/signing.yaml
+        run: ./.github/internal/scripts/invoke-release-signing.ps1
+
+      - name: Create release archive
+        id: archive
+        shell: pwsh
+        run: |
+          function Ensure-YamlSupport {
+            if (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue) {
+              return
+            }
+
+            if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+              Register-PSRepository -Default -ErrorAction Stop
+            }
+
+            Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            Import-Module powershell-yaml -ErrorAction Stop
+          }
+
+          function Normalize-RelativePath {
+            param([string]$PathValue)
+
+            if ([string]::IsNullOrWhiteSpace($PathValue)) {
+              return ''
+            }
+
+            $normalized = ($PathValue -replace '\\', '/').Trim()
+
+            if ($normalized.StartsWith('/') -or $normalized.StartsWith('//') -or $normalized -match '^[A-Za-z]:/') {
+              throw "Path '$PathValue' must be repository-relative (absolute paths are not allowed)."
+            }
+
+            while ($normalized.StartsWith('./')) {
+              $normalized = $normalized.Substring(2)
+            }
+
+            if ($normalized -eq '.') {
+              return '.'
+            }
+
+            $normalized = $normalized.Trim('/')
+            if ([string]::IsNullOrWhiteSpace($normalized)) {
+              return '.'
+            }
+            if ($normalized -match '(^|/)\.\.(\/|$)') {
+              throw "Path '$PathValue' escapes repository root and is not allowed."
+            }
+
+            return $normalized
+          }
+
+          function Test-PathRuleMatch {
+            param(
+              [string]$RelativeFilePath,
+              [string]$RulePath
+            )
+
+            if ($RulePath -eq '.') {
+              return $true
+            }
+
+            if ($RelativeFilePath.Equals($RulePath, [System.StringComparison]::OrdinalIgnoreCase)) {
+              return $true
+            }
+
+            if ($RelativeFilePath.StartsWith("$RulePath/", [System.StringComparison]::OrdinalIgnoreCase)) {
+              return $true
+            }
+
+            return $false
+          }
+
+          function Assert-PathRuleExists {
+            param(
+              [string]$RulePath,
+              [string]$RuleLabel,
+              [string]$PackageName
+            )
+
+            if ($RulePath -eq '.') {
+              return
+            }
+
+            if (-not (Test-Path -LiteralPath $RulePath)) {
+              throw "Package '$PackageName' has $RuleLabel path '$RulePath' that does not exist."
+            }
+          }
+
+          function Resolve-PackageFiles {
+            param(
+              [string]$PackageName,
+              [string[]]$IncludeRules,
+              [string[]]$ExcludeRules,
+              [string[]]$GlobalExclusions,
+              [System.Collections.Generic.List[string]]$AllFiles
+            )
+
+            $selected = New-Object System.Collections.Generic.List[string]
+            foreach ($filePath in $AllFiles) {
+              $included = $false
+              foreach ($rule in $IncludeRules) {
+                if (Test-PathRuleMatch -RelativeFilePath $filePath -RulePath $rule) {
+                  $included = $true
+                  break
+                }
+              }
+
+              if (-not $included) {
+                continue
+              }
+
+              foreach ($rule in $GlobalExclusions) {
+                if (Test-PathRuleMatch -RelativeFilePath $filePath -RulePath $rule) {
+                  $included = $false
+                  break
+                }
+              }
+
+              if (-not $included) {
+                continue
+              }
+
+              foreach ($rule in $ExcludeRules) {
+                if (Test-PathRuleMatch -RelativeFilePath $filePath -RulePath $rule) {
+                  $included = $false
+                  break
+                }
+              }
+
+              if ($included) {
+                $selected.Add($filePath)
+              }
+            }
+
+            if ($selected.Count -eq 0) {
+              throw "Package '$PackageName' resolved zero files after include/exclude evaluation."
+            }
+
+            return @($selected | Sort-Object -Unique)
+          }
+
+          function New-ManifestRows {
+            param(
+              [string]$PackageRoot,
+              [string[]]$PackageFiles
+            )
+
+            $packageRootFull = (Resolve-Path -LiteralPath $PackageRoot).Path
+            $rows = New-Object System.Collections.Generic.List[string]
+            foreach ($file in $PackageFiles) {
+              $hash = (Get-FileHash -Path $file -Algorithm SHA256).Hash
+              $relative = [System.IO.Path]::GetRelativePath($packageRootFull, $file) -replace '\\', '/'
+              $rows.Add("$hash  $relative")
+            }
+
+            return @($rows)
+          }
+
+          Ensure-YamlSupport
+
+          $releaseTag = "$env:RELEASE_TAG"
+          if ([string]::IsNullOrWhiteSpace($releaseTag)) {
+            throw "RELEASE_TAG is not set; unable to create release archive."
+          }
+
+          $repoFallback = "${{ github.repository }}" -replace '.+/', ''
+          $pipelineConfigFile = "${{ env.PIPELINE_CONFIG_FILE }}"
+          $defaultPackageName = $repoFallback
+          if (Test-Path $pipelineConfigFile) {
+            $pipelineConfig = Get-Content -Path $pipelineConfigFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+            if (-not [string]::IsNullOrWhiteSpace($pipelineConfig.releasePackageName)) {
+              $defaultPackageName = [string]$pipelineConfig.releasePackageName
+            }
+          }
+
+          $globalExclusions = @('.git', 'out', '.release-stage')
+          $exclusionsFile = "${{ env.RELEASE_PACKAGE_EXCLUSIONS_FILE }}"
+          if (Test-Path $exclusionsFile) {
+            $exclusionConfig = Get-Content -Path $exclusionsFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+            if ($null -ne $exclusionConfig.defaultExclusions) {
+              $globalExclusions += @($exclusionConfig.defaultExclusions | ForEach-Object { Normalize-RelativePath -PathValue ([string]$_) })
+            }
+            if ($null -ne $exclusionConfig.additionalExclusions) {
+              $globalExclusions += @($exclusionConfig.additionalExclusions | ForEach-Object { Normalize-RelativePath -PathValue ([string]$_) })
+            }
+          }
+          $globalExclusions = @($globalExclusions | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+
+          $allRepoFiles = New-Object System.Collections.Generic.List[string]
+          $repoRoot = (Resolve-Path '.').Path
+
+          $topLevel = @(Get-ChildItem -Path . -Force | Where-Object { $_.Name -notin $globalExclusions })
+          foreach ($item in $topLevel) {
+            $files = if ($item.PSIsContainer) { Get-ChildItem -Path $item.FullName -Recurse -File -Force } else { @($item) }
+            foreach ($file in $files) {
+              $relativePath = $file.FullName.Substring($repoRoot.Length).TrimStart([char]'\', [char]'/') -replace '\\', '/'
+              $allRepoFiles.Add($relativePath)
+            }
+          }
+
+          $packageDefinitions = New-Object System.Collections.Generic.List[object]
+          $allowPathOverlaps = $false
+          $releasePackagesConfigFile = "${{ env.RELEASE_PACKAGES_CONFIG_FILE }}"
+          if (Test-Path $releasePackagesConfigFile) {
+            $releasePackagesConfig = Get-Content -Path $releasePackagesConfigFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+
+            if ($null -ne $releasePackagesConfig.allowPathOverlaps) {
+              $allowPathOverlaps = [System.Convert]::ToBoolean($releasePackagesConfig.allowPathOverlaps)
+            }
+
+            $singlePackageEnabled = $false
+            $singlePackageName = $defaultPackageName
+            if ($null -ne $releasePackagesConfig.singlePackage) {
+              if ($null -ne $releasePackagesConfig.singlePackage.enabled) {
+                $singlePackageEnabled = [System.Convert]::ToBoolean($releasePackagesConfig.singlePackage.enabled)
+              }
+              if (-not [string]::IsNullOrWhiteSpace($releasePackagesConfig.singlePackage.releasePackageName)) {
+                $singlePackageName = [string]$releasePackagesConfig.singlePackage.releasePackageName
+              }
+            }
+
+            $configuredPackages = @()
+            if ($null -ne $releasePackagesConfig.releasePackages) {
+              $configuredPackages = @($releasePackagesConfig.releasePackages)
+            }
+
+            foreach ($package in $configuredPackages) {
+              $packageName = [string]$package.name
+              if ([string]::IsNullOrWhiteSpace($packageName)) {
+                throw "Each releasePackages entry in '$releasePackagesConfigFile' must include 'name'."
+              }
+
+              if ($null -eq $package.includePaths) {
+                throw "Package '$packageName' must define includePaths."
+              }
+
+              if ($null -eq $package.excludePaths) {
+                throw "Package '$packageName' must define excludePaths (use [] when no excludes are needed)."
+              }
+
+              $includeRules = @($package.includePaths | ForEach-Object { Normalize-RelativePath -PathValue ([string]$_) } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+              $excludeRules = @($package.excludePaths | ForEach-Object { Normalize-RelativePath -PathValue ([string]$_) } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+              if ($includeRules.Count -eq 0) {
+                throw "Package '$packageName' must include at least one includePaths entry."
+              }
+
+              foreach ($rule in $includeRules) {
+                Assert-PathRuleExists -RulePath $rule -RuleLabel 'includePaths' -PackageName $packageName
+              }
+
+              $packageDefinitions.Add([pscustomobject]@{
+                name = $packageName
+                includeRules = @($includeRules)
+                excludeRules = @($excludeRules)
+                description = [string]$package.description
+              })
+            }
+
+            if ($singlePackageEnabled) {
+              $packageDefinitions.Add([pscustomobject]@{
+                name = $singlePackageName
+                includeRules = @('.')
+                excludeRules = @()
+                description = 'Default single-package output'
+              })
+            }
+
+            if ($packageDefinitions.Count -eq 0) {
+              $packageDefinitions.Add([pscustomobject]@{
+                name = $defaultPackageName
+                includeRules = @('.')
+                excludeRules = @()
+                description = 'Default single-package output'
+              })
+            }
+          }
+          else {
+            $packageDefinitions.Add([pscustomobject]@{
+              name = $defaultPackageName
+              includeRules = @('.')
+              excludeRules = @()
+              description = 'Default single-package output'
+            })
+          }
+
+          $seenPackageNames = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+          foreach ($definition in $packageDefinitions) {
+            $resolvedName = [string]$definition.name
+            if ($resolvedName -match '[<>:"/\\|\?\*]' -or $resolvedName.Contains('..')) {
+              throw "Invalid package name '$resolvedName'. Package names must be safe file names and must not contain path separators, '..', or Windows-reserved characters."
+            }
+
+            if (-not $seenPackageNames.Add($resolvedName)) {
+              throw "Duplicate package name '$resolvedName' detected. Package names must be unique."
+            }
+          }
+
+          New-Item -ItemType Directory -Path out -Force | Out-Null
+
+          $stageRoot = '.release-stage'
+          if (Test-Path $stageRoot) {
+            Remove-Item -Path $stageRoot -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
+
+          $fileOwners = @{}
+          $overlapNotices = New-Object System.Collections.Generic.List[string]
+          $archivePaths = New-Object System.Collections.Generic.List[string]
+
+          foreach ($definition in $packageDefinitions) {
+            # Package name already validated for uniqueness and filename safety above.
+            $packageName = [string]$definition.name
+            if ([string]::IsNullOrWhiteSpace($packageName)) {
+              throw "Invalid package name '$packageName'. Package 'name' must be a non-empty string."
+            }
+            $resolvedFiles = Resolve-PackageFiles -PackageName $packageName -IncludeRules @($definition.includeRules) -ExcludeRules @($definition.excludeRules) -GlobalExclusions $globalExclusions -AllFiles $allRepoFiles
+
+            foreach ($filePath in $resolvedFiles) {
+              if ($fileOwners.ContainsKey($filePath)) {
+                if ($allowPathOverlaps) {
+                  $overlapNotices.Add("- '$filePath' included by $($fileOwners[$filePath]) and $packageName.")
+                  continue
+                }
+
+                throw "Conflicting package paths detected: '$filePath' is selected by both '$($fileOwners[$filePath])' and '$packageName'. Set allowPathOverlaps=true in '$releasePackagesConfigFile' to permit overlap."
+              }
+
+              $fileOwners[$filePath] = $packageName
+            }
+
+            $packageStageRoot = Join-Path $stageRoot $packageName
+            New-Item -ItemType Directory -Path $packageStageRoot -Force | Out-Null
+
+            foreach ($relativePath in $resolvedFiles) {
+              $sourcePath = Join-Path $repoRoot ($relativePath -replace '/', '\\')
+              $destinationPath = Join-Path $packageStageRoot ($relativePath -replace '/', '\\')
+              $destinationDir = Split-Path -Path $destinationPath -Parent
+              New-Item -ItemType Directory -Path $destinationDir -Force | Out-Null
+              Copy-Item -LiteralPath $sourcePath -Destination $destinationPath -Force
+            }
+
+            $manifestName = "${{ env.RELEASE_HASH_MANIFEST_FILE }}"
+            $manifestPath = Join-Path $packageStageRoot $manifestName
+            $packageFiles = @(Get-ChildItem -Path $packageStageRoot -Recurse -File -Force | Where-Object { $_.FullName -ne $manifestPath } | Sort-Object FullName)
+
+            $manifestRows = New-ManifestRows -PackageRoot $packageStageRoot -PackageFiles @($packageFiles | ForEach-Object { $_.FullName })
+            @(
+              "# Release package hash manifest (SHA256)"
+              "# Package: $packageName"
+              "# Generated: $(Get-Date -Format o)"
+              ""
+            ) + $manifestRows | Set-Content -Path $manifestPath -Encoding utf8
+
+            $archivePath = "out/$packageName-$releaseTag.zip"
+            if (Test-Path $archivePath) {
+              Remove-Item -Path $archivePath -Force
+            }
+
+            $archiveInputs = Get-ChildItem -Path $packageStageRoot -Force | Select-Object -ExpandProperty FullName
+            Compress-Archive -Path $archiveInputs -DestinationPath $archivePath -Force
+            $archivePaths.Add($archivePath)
+            Write-Host "Archive created: $archivePath"
+          }
+
+          @(
+            '## Release archive outputs'
+            "- Package count: $($packageDefinitions.Count)"
+            "- Path overlap support: $allowPathOverlaps"
+          ) + @($archivePaths | ForEach-Object { "- $_" }) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          if ($allowPathOverlaps -and $overlapNotices.Count -gt 0) {
+            @('### Shared paths included in multiple packages') + @($overlapNotices | Select-Object -Unique) |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+
+          if (Test-Path $stageRoot) {
+            Remove-Item -Path $stageRoot -Recurse -Force
+          }
+
+          $artifactName = if ($packageDefinitions.Count -eq 1) { [string]$packageDefinitions[0].name } else { 'release-packages' }
+          "package_name=$artifactName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Sign release artifacts
+        shell: pwsh
+        env:
+          SIGNING_CONFIG_FILE: pipeline-config/ref/signing.yaml
+        run: |
+          ./.github/internal/scripts/sign-release-artifacts.ps1 -SigningConfigFile $env:SIGNING_CONFIG_FILE -Stage $env:RELEASE_STAGE -WorkspaceRoot (Get-Location).Path -RepositorySignGlobs @() -ArtifactRoots @('out')
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.archive.outputs.package_name }}-${{ env.RELEASE_TAG }}
+          path: out/**
+
   release:
-    if: ${{ vars.PIPELINE_ENABLED == 'true' && (github.event_name != 'pull_request' || (github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main')) }}
-    uses: Semperis-Community/.github/.github/workflows/release-reusable.yaml@v1.0.0
-    with:
-      release_stage: ${{ github.event_name == 'workflow_dispatch' && inputs.release_stage || 'config' }}
-      debug_dependency_access: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_dependency_access || false }}
-      pkg_dependency_reference_file: pipeline-config/ref/pkg-dependencies.yaml
-      test_dependency_reference_file: pipeline-config/ref/test-dependencies.yaml
-      powershell_tools_file: pipeline-config/ref/powershell-tools.yaml
-      publish_targets_file: pipeline-config/ref/publish-targets.yaml
-      release_state_lookup_file: .github/internal/versioning/releasestate.json
-      legal_disclaimer_template_file: .github/internal/templates/legal-disclaimer-template.txt
-      pipeline_config_file: pipeline-config/ref/pipeline.yaml
-      release_packages_config_file: pipeline-config/ref/release-packages.yaml
-      release_package_exclusions_file: pipeline-config/ref/release-package-exclusions.yaml
-      release_hash_manifest_file: manifest.txt
-      manual_release_config_file: pipeline-config/ref/manual-release.yaml
-      release_stage_config_file: pipeline-config/ref/release-stages.yaml
-      signing_config_file: pipeline-config/ref/signing.yaml
-      notify_config_file: pipeline-config/ref/notify.yaml
-      incident_config_file: pipeline-config/ref/incidents.yaml
-      workflow_contract_version: 1.0.0
-    secrets: inherit
+    needs:
+      - prepare-release
+      - create-release-tag
+      - detect-stage
+    if: ${{ (github.event_name != 'pull_request' || (github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main')) && needs.prepare-release.result == 'success' }}
+    runs-on: windows-2022
+
+    env:
+      RELEASE_STAGE: ${{ needs.detect-stage.outputs.stage }}
+      RELEASE_TAG: ${{ needs.create-release-tag.outputs.release_tag || github.ref_name }}
+      VERSION_LOOKUP_CODE: ${{ needs.create-release-tag.outputs.version_lookup_code }}
+      SERVICE_PACK_DIGIT: ${{ needs.create-release-tag.outputs.service_pack_digit }}
+      RELEASE_STAGE_DIGIT: ${{ needs.create-release-tag.outputs.release_stage_digit }}
+      NUMERIC_VERSION_VALUES: ${{ needs.create-release-tag.outputs.numeric_version_values }}
+      PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
+      CONTOSO_NUGET_API_KEY: ${{ secrets.CONTOSO_NUGET_API_KEY }}
+      CONTOSO_PYPI_API_KEY: ${{ secrets.CONTOSO_PYPI_API_KEY }}
+      SHAREPOINT_RELEASE_CREDENTIALS_SAND: ${{ secrets.SHAREPOINT_RELEASE_CREDENTIALS_SAND }}
+      SHAREPOINT_RELEASE_CREDENTIALS_PROD: ${{ secrets.SHAREPOINT_RELEASE_CREDENTIALS_PROD }}
+
+    # Maps to a GitHub Environment of the same name (alpha/beta/rc/production).
+    # Azure OIDC auth runs in prepare-release so the environment name is not embedded in the auth subject.
+    environment: ${{ needs.detect-stage.outputs.stage }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Download prepared release artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ needs.prepare-release.outputs.package_name }}-${{ env.RELEASE_TAG }}
+          path: out
+
+      - name: Setup PowerShell tools
+        uses: ./.github/actions/setup-powershell-tools
+        with:
+          dependency-file: ${{ env.POWERSHELL_TOOLS_FILE }}
+
+      - name: Publish PowerShell modules to external registries
+        if: needs.prepare-release.outputs.has_powershell == 'True'
+        shell: pwsh
+        run: |
+          $dependencyFile = "${{ env.PUBLISH_TARGETS_FILE }}"
+          if (-not (Test-Path $dependencyFile)) {
+            Write-Host "Publish targets file '$dependencyFile' not found. Skipping PowerShell publish."
+            exit 0
+          }
+
+          if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+            if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+              Register-PSRepository -Default -ErrorAction Stop
+            }
+            Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            Import-Module powershell-yaml -ErrorAction Stop
+          }
+
+          $dependencyConfig = Get-Content -Path $dependencyFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+          $publishTargets = @()
+          if ($null -ne $dependencyConfig.powershellPublishTargets) {
+            $publishTargets = @($dependencyConfig.powershellPublishTargets)
+          }
+
+          $currentStage = $env:RELEASE_STAGE
+          $publishTargets = @($publishTargets | Where-Object {
+            $targetEnabled = $true
+            if ($null -ne $_.enabled) {
+              if ($_.enabled -is [bool]) {
+                $targetEnabled = [bool]$_.enabled
+              }
+              else {
+                $normalizedTargetEnabled = ([string]$_.enabled).Trim().ToLowerInvariant()
+                if ($normalizedTargetEnabled -in @('true', '1', 'yes', 'on')) {
+                  $targetEnabled = $true
+                }
+                elseif ($normalizedTargetEnabled -in @('false', '0', 'no', 'off')) {
+                  $targetEnabled = $false
+                }
+                else {
+                  throw "Invalid sharePointTargets.enabled value '$($_.enabled)' for target '$($_.name)'. Use true or false."
+                }
+              }
+            }
+
+            $targetEnabled -and ($null -eq $_.stages -or $_.stages.Count -eq 0 -or $currentStage -in $_.stages)
+          })
+
+          if ($publishTargets.Count -eq 0) {
+            Write-Host "No powershellPublishTargets applicable for stage '$currentStage'. Skipping PowerShell publish."
+            exit 0
+          }
+
+          $modules = Get-ChildItem -Path . -Recurse -File -Filter *.psd1 -ErrorAction SilentlyContinue |
+            Where-Object { $_.DirectoryName -notmatch '\.github' }
+
+          if (-not $modules) {
+            Write-Host "No .psd1 module manifests found. Skipping PowerShell publish."
+            exit 0
+          }
+
+          $targetResults = New-Object System.Collections.Generic.List[string]
+
+          foreach ($target in $publishTargets) {
+            $repoName   = $target.name
+            $secretName = $target.secretEnvVar
+            $apiKey     = [System.Environment]::GetEnvironmentVariable($secretName)
+
+            if ([string]::IsNullOrWhiteSpace($apiKey)) {
+              Write-Host "::warning::Secret '$secretName' is not set. Skipping publish to '$repoName'."
+              $targetResults.Add("- PowerShell target '$repoName': skipped (missing configured secret '$secretName').")
+              continue
+            }
+
+            foreach ($manifest in $modules) {
+              $moduleDir = $manifest.DirectoryName
+              Write-Host "Publishing '$($manifest.BaseName)' to '$repoName'..."
+              Publish-Module -Path $moduleDir -Repository $repoName -NuGetApiKey $apiKey -Force -ErrorAction Stop
+              Write-Host "Published '$($manifest.BaseName)' to '$repoName'."
+            }
+
+            $targetResults.Add("- PowerShell target '$repoName': published.")
+          }
+
+          if ($targetResults.Count -gt 0) {
+            @('### PowerShell publish results') + $targetResults |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+
+      - name: Setup .NET SDK
+        if: needs.prepare-release.outputs.has_dotnet == 'True'
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '9.0.x'
+          cache: true
+
+      - name: Publish .NET packages to external registries
+        if: needs.prepare-release.outputs.has_dotnet == 'True'
+        shell: pwsh
+        run: |
+          $dependencyFile = "${{ env.PUBLISH_TARGETS_FILE }}"
+          if (-not (Test-Path $dependencyFile)) {
+            Write-Host "Publish targets file '$dependencyFile' not found. Skipping NuGet publish."
+            exit 0
+          }
+
+          if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+            if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+              Register-PSRepository -Default -ErrorAction Stop
+            }
+            Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            Import-Module powershell-yaml -ErrorAction Stop
+          }
+
+          $dependencyConfig = Get-Content -Path $dependencyFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+          $publishTargets = @()
+          if ($null -ne $dependencyConfig.nugetPublishTargets) {
+            $publishTargets = @($dependencyConfig.nugetPublishTargets)
+          }
+
+          $currentStage = $env:RELEASE_STAGE
+          $publishTargets = @($publishTargets | Where-Object {
+            $null -eq $_.stages -or $_.stages.Count -eq 0 -or $currentStage -in $_.stages
+          })
+
+          if ($publishTargets.Count -eq 0) {
+            Write-Host "No nugetPublishTargets applicable for stage '$currentStage'. Skipping NuGet publish."
+            exit 0
+          }
+
+          $packages = @(Get-ChildItem -Path out/dotnet -Recurse -Filter *.nupkg -ErrorAction SilentlyContinue)
+          if ($packages.Count -eq 0) {
+            Write-Host "No .nupkg files found in out/dotnet. Skipping NuGet publish."
+            exit 0
+          }
+
+          $targetResults = New-Object System.Collections.Generic.List[string]
+
+          foreach ($target in $publishTargets) {
+            $sourceName = $target.name
+            $sourceUrl  = $target.url
+            $secretName = $target.secretEnvVar
+            $apiKey     = [System.Environment]::GetEnvironmentVariable($secretName)
+
+            if ([string]::IsNullOrWhiteSpace($apiKey)) {
+              Write-Host "::warning::Secret '$secretName' is not set. Skipping NuGet push to '$sourceName'."
+              $targetResults.Add("- NuGet target '$sourceName': skipped (missing configured secret '$secretName').")
+              continue
+            }
+
+            foreach ($pkg in $packages) {
+              Write-Host "Pushing '$($pkg.Name)' to '$sourceName' ($sourceUrl)..."
+              dotnet nuget push $pkg.FullName --source $sourceUrl --api-key $apiKey --skip-duplicate
+            }
+
+            $targetResults.Add("- NuGet target '$sourceName': published.")
+          }
+
+          if ($targetResults.Count -gt 0) {
+            @('### NuGet publish results') + $targetResults |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+
+      - name: Setup Python
+        if: needs.prepare-release.outputs.has_python == 'True'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Publish Python distributions to external registries
+        if: needs.prepare-release.outputs.has_python == 'True'
+        shell: pwsh
+        run: |
+          $dependencyFile = "${{ env.PUBLISH_TARGETS_FILE }}"
+          if (-not (Test-Path $dependencyFile)) {
+            Write-Host "Publish targets file '$dependencyFile' not found. Skipping Python publish."
+            exit 0
+          }
+
+          if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+            if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+              Register-PSRepository -Default -ErrorAction Stop
+            }
+            Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            Import-Module powershell-yaml -ErrorAction Stop
+          }
+
+          $dependencyConfig = Get-Content -Path $dependencyFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+          $publishTargets = @()
+          if ($null -ne $dependencyConfig.pythonPublishTargets) {
+            $publishTargets = @($dependencyConfig.pythonPublishTargets)
+          }
+
+          $currentStage = $env:RELEASE_STAGE
+          $publishTargets = @($publishTargets | Where-Object {
+            $null -eq $_.stages -or $_.stages.Count -eq 0 -or $currentStage -in $_.stages
+          })
+
+          if ($publishTargets.Count -eq 0) {
+            Write-Host "No pythonPublishTargets applicable for stage '$currentStage'. Skipping Python publish."
+            exit 0
+          }
+
+          $distFiles = @(Get-ChildItem -Path out/python -ErrorAction SilentlyContinue)
+          if ($distFiles.Count -eq 0) {
+            Write-Host "No distribution files found in out/python. Skipping Python publish."
+            exit 0
+          }
+
+          python -m pip install --quiet twine
+
+          $targetResults = New-Object System.Collections.Generic.List[string]
+
+          foreach ($target in $publishTargets) {
+            $targetName   = $target.name
+            $repoUrl      = $target.repositoryUrl
+            $secretName   = $target.secretEnvVar
+            $apiKey       = [System.Environment]::GetEnvironmentVariable($secretName)
+
+            if ([string]::IsNullOrWhiteSpace($apiKey)) {
+              Write-Host "::warning::Secret '$secretName' is not set. Skipping Python publish to '$targetName'."
+              $targetResults.Add("- Python target '$targetName': skipped (missing configured secret '$secretName').")
+              continue
+            }
+
+            Write-Host "Uploading distributions to '$targetName' ($repoUrl)..."
+            & python -m twine upload --repository-url $repoUrl --username __token__ --password $apiKey out/python/*
+            $targetResults.Add("- Python target '$targetName': published.")
+          }
+
+          if ($targetResults.Count -gt 0) {
+            @('### Python publish results') + $targetResults |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+
+      - name: Publish GitHub release
+        if: >
+          startsWith(github.ref, 'refs/tags/') ||
+          github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'pull_request' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main') ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $repo = "${{ github.repository }}"
+          $tag = "$env:RELEASE_TAG"
+
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            throw "RELEASE_TAG is not set; unable to publish GitHub release."
+          }
+
+          $assets = @(Get-ChildItem -Path out -Recurse -File | ForEach-Object { $_.FullName })
+
+          if ($assets.Count -eq 0) {
+            throw "No release assets found under 'out'."
+          }
+
+          gh release view $tag --repo $repo *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Immutable release policy violation: release '$tag' already exists. Re-publishing or overwriting existing releases is not allowed."
+          }
+          else {
+            Write-Host "Creating release '$tag' with generated notes."
+            gh release create $tag @assets --repo $repo --title $tag --generate-notes
+          }
 
   sharepoint-publish:
     # workflow_call is used here because gh release create uses GITHUB_TOKEN, which
     # suppresses the release: published event and prevents the workflow from auto-triggering.
     if: ${{ needs.release.result == 'success' }}
     needs:
+      - create-release-tag
+      - detect-stage
       - release
-    uses: Semperis-Community/.github/.github/workflows/sharepoint-publish-reusable.yaml@v1.0.0
+    uses: ./.github/workflows/sharepoint-publish-release.yaml
     with:
-      release-tag: ${{ needs.release.outputs.release_tag }}
-      release-stage: ${{ needs.release.outputs.release_stage }}
+      release-tag: ${{ needs.create-release-tag.outputs.release_tag }}
+      release-stage: ${{ needs.detect-stage.outputs.stage }}
     secrets:
       SHAREPOINT_RELEASE_CREDENTIALS_SAND: ${{ secrets.SHAREPOINT_RELEASE_CREDENTIALS_SAND }}
       SHAREPOINT_RELEASE_CREDENTIALS_PROD: ${{ secrets.SHAREPOINT_RELEASE_CREDENTIALS_PROD }}
+
+  notify:
+    # Send release notifications for failure/cancelled and opt-in success.
+    if: ${{ (github.event_name != 'pull_request' || (github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main')) && always() }}
+    needs:
+      - validate-repo-structure
+      - spell-check
+      - markdownlint
+      - verify-authoritative-ci
+      - create-release-tag
+      - detect-stage
+      - prepare-release
+      - release
+      - sharepoint-publish
+    uses: ./.github/workflows/notify.yaml
+    with:
+      source_workflow: release
+      status: ${{ contains(join(needs.*.result, ','), 'failure') && 'failure' || (contains(join(needs.*.result, ','), 'cancelled') && 'cancelled' || 'success') }}
+      ref: ${{ github.ref_name }}
+      run_url: ${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+      summary: ${{ toJson(needs) }}
+      notify_on_success: true
+    secrets: inherit
+
+  incident:
+    # Open or update deduplicated pipeline incident issues for failures/cancellations.
+    if: ${{ (github.event_name != 'pull_request' || (github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main')) && always() && (contains(join(needs.*.result, ','), 'failure') || contains(join(needs.*.result, ','), 'cancelled')) }}
+    needs:
+      - validate-repo-structure
+      - spell-check
+      - markdownlint
+      - verify-authoritative-ci
+      - create-release-tag
+      - detect-stage
+      - prepare-release
+      - release
+      - sharepoint-publish
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/incident.yaml
+    with:
+      source_workflow: release
+      status: ${{ contains(join(needs.*.result, ','), 'failure') && 'failure' || (contains(join(needs.*.result, ','), 'cancelled') && 'cancelled' || 'success') }}
+      ref: ${{ github.ref_name }}
+      run_url: ${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+      summary: ${{ toJson(needs) }}
+
+  workflow-outcome-summary:
+    # Emit a final matrix of release workflow job outcomes.
+    if: ${{ (github.event_name != 'pull_request' || (github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main')) && always() }}
+    needs:
+      - validate-repo-structure
+      - spell-check
+      - markdownlint
+      - verify-authoritative-ci
+      - create-release-tag
+      - detect-stage
+      - prepare-release
+      - release
+      - sharepoint-publish
+      - notify
+      - incident
+    runs-on: windows-2022
+    steps:
+      - name: Summarize final workflow outcomes
+        shell: pwsh
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          $needs = $env:NEEDS_JSON | ConvertFrom-Json -AsHashtable
+
+          @(
+            '## Final Outcome Matrix'
+            '| Job | Result |'
+            '| --- | --- |'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          foreach ($jobName in ($needs.Keys | Sort-Object)) {
+            $result = [string]$needs[$jobName].result
+            if ([string]::IsNullOrWhiteSpace($result)) {
+              $result = 'unknown'
+            }
+
+            "| $jobName | $result |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+

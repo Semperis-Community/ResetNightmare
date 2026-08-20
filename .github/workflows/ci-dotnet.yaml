@@ -1,4 +1,4 @@
-name: CI .NET Wrapper
+name: CI .NET
 
 on:
   workflow_call:
@@ -13,10 +13,107 @@ on:
         default: pipeline-config/ref/test-dependencies.yaml
 
 jobs:
-  ci-dotnet:
-    if: ${{ vars.PIPELINE_ENABLED == 'true' }}
-    uses: Semperis-Community/.github/.github/workflows/ci-dotnet-reusable.yaml@v1.0.0
-    with:
-      ref: ${{ inputs.ref }}
-      dependency-file: ${{ inputs['dependency-file'] }}
-    secrets: inherit
+  lint-and-test-dotnet:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Detect .NET project content
+        id: detect
+        shell: pwsh
+        run: |
+          $projects = @(Get-ChildItem -Path . -Recurse -File -Include *.sln,*.csproj -ErrorAction SilentlyContinue)
+          $hasProject = $projects.Count -gt 0
+          $hasLock = @(Get-ChildItem -Path . -Recurse -File -Filter packages.lock.json -ErrorAction SilentlyContinue).Count -gt 0
+
+          "has_project=$($hasProject.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "has_lock=$($hasLock.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '9.0.x'
+          cache: false
+
+      - name: Configure NuGet sources from dependency file
+        if: steps.detect.outputs.has_project == 'true'
+        shell: pwsh
+        run: |
+          $dependencyFile = "${{ inputs.dependency-file }}"
+          if (-not (Test-Path $dependencyFile)) {
+            Write-Host "Dependency file '$dependencyFile' not found. Using default NuGet sources."
+            exit 0
+          }
+
+          if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+            if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+              Register-PSRepository -Default -ErrorAction Stop
+            }
+            Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            Import-Module powershell-yaml -ErrorAction Stop
+          }
+
+          $dependencyConfig = Get-Content -Path $dependencyFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+          $nugetSources = @()
+          if ($null -ne $dependencyConfig.nugetSources) {
+            $nugetSources = @($dependencyConfig.nugetSources)
+          }
+
+          foreach ($source in $nugetSources) {
+            $sourceName = $source.name
+            $sourceUrl = $source.url
+            if ([string]::IsNullOrWhiteSpace($sourceName) -or [string]::IsNullOrWhiteSpace($sourceUrl)) {
+              throw "Each nugetSources entry must include 'name' and 'url'."
+            }
+
+            try {
+              dotnet nuget add source $sourceUrl --name $sourceName
+              Write-Host "Added NuGet source '$sourceName' ($sourceUrl)."
+            }
+            catch {
+              dotnet nuget update source $sourceName --source $sourceUrl
+              Write-Host "Updated NuGet source '$sourceName' ($sourceUrl)."
+            }
+          }
+
+      - name: Lint .NET and C# code
+        if: steps.detect.outputs.has_project == 'true'
+        shell: pwsh
+        run: |
+          dotnet format --verify-no-changes
+
+      - name: Restore .NET dependencies
+        if: steps.detect.outputs.has_project == 'true'
+        shell: pwsh
+        run: |
+          dotnet restore
+
+      - name: Build .NET solution
+        if: steps.detect.outputs.has_project == 'true'
+        shell: pwsh
+        run: |
+          dotnet build --configuration Release --no-restore
+
+      - name: Run .NET tests
+        if: steps.detect.outputs.has_project == 'true'
+        shell: pwsh
+        run: |
+          dotnet test --configuration Release --no-build --logger "trx;LogFileName=dotnet-test-results.trx" --results-directory TestResults
+
+      - name: Skip when no .NET project exists
+        if: steps.detect.outputs.has_project != 'true'
+        shell: pwsh
+        run: |
+          Write-Host "No .NET solution or project files found. Skipping .NET validation."
+
+      - name: Upload .NET test results
+        if: always() && hashFiles('TestResults/*.trx') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: dotnet-test-results
+          path: TestResults/*.trx
+
