@@ -1,4 +1,6 @@
-name: Incident Wrapper
+name: Incident
+
+run-name: Incident | ${{ inputs.source_workflow }} | ${{ inputs.status }}
 
 on:
   workflow_call:
@@ -24,20 +26,202 @@ on:
         required: false
         default: ""
         type: string
-      incident_config_file:
-        description: Path to the incident policy config file in the repository.
-        required: true
-        type: string
+
+permissions:
+  contents: read
+  issues: write
 
 jobs:
-  incident:
-    if: ${{ vars.PIPELINE_ENABLED == 'true' }}
-    uses: Semperis-Community/.github/.github/workflows/incident-reusable.yaml@v1.0.0
-    with:
-      source_workflow: ${{ inputs.source_workflow }}
-      status: ${{ inputs.status }}
-      ref: ${{ inputs.ref }}
-      run_url: ${{ inputs.run_url }}
-      summary: ${{ inputs.summary }}
-      incident_config_file: ${{ inputs.incident_config_file }}
-    secrets: inherit
+  upsert-incident:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: incident-${{ inputs.source_workflow }}-${{ inputs.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Resolve incident policy
+        id: policy
+        shell: pwsh
+        env:
+          INPUT_SOURCE_WORKFLOW: ${{ inputs.source_workflow }}
+          INPUT_STATUS: ${{ inputs.status }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_RUN_URL: ${{ inputs.run_url }}
+          INPUT_SUMMARY: ${{ inputs.summary }}
+        run: |
+          $configPath = "pipeline-config/ref/incidents.yaml"
+          $sourceWorkflow = $env:INPUT_SOURCE_WORKFLOW
+          $status = $env:INPUT_STATUS
+          $refName = $env:INPUT_REF
+          $runUrl = $env:INPUT_RUN_URL
+          $summary = $env:INPUT_SUMMARY
+
+          if ([string]::IsNullOrWhiteSpace($refName)) {
+            $refName = "${{ github.ref_name }}"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($runUrl)) {
+            $runUrl = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+
+          $enabled = $false
+          $autoCloseOnSuccess = $false
+          $labels = @('pipeline-incident')
+          $assignees = @()
+          $configFound = $false
+
+          if (Test-Path -Path $configPath) {
+            $configFound = $true
+
+            if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+              if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+                Register-PSRepository -Default -ErrorAction Stop
+              }
+
+              Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+              Import-Module powershell-yaml -ErrorAction Stop
+            }
+
+            $incidentConfig = Get-Content -Path $configPath -Raw | ConvertFrom-Yaml -ErrorAction Stop
+
+            if ($null -ne $incidentConfig.enabled) {
+              $enabled = [bool]$incidentConfig.enabled
+            }
+
+            if ($null -ne $incidentConfig.autoCloseOnSuccess) {
+              $autoCloseOnSuccess = [bool]$incidentConfig.autoCloseOnSuccess
+            }
+
+            if ($incidentConfig.labels -is [System.Collections.IEnumerable]) {
+              $candidateLabels = @($incidentConfig.labels | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+              if ($candidateLabels.Count -gt 0) {
+                $labels = @($candidateLabels)
+              }
+            }
+
+            if ($incidentConfig.assignees -is [System.Collections.IEnumerable]) {
+              $assignees = @($incidentConfig.assignees | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+            }
+          }
+
+          if ($labels -notcontains 'pipeline-incident') {
+            $labels += 'pipeline-incident'
+          }
+
+          $statusBucket = if ($status -eq 'success') { 'success' } else { 'non-success' }
+          $normalizedRef = $refName.ToLowerInvariant()
+          $incidentKey = "$sourceWorkflow|$normalizedRef|$statusBucket"
+
+          $titleStatus = if ($status -eq 'cancelled') { 'cancelled' } elseif ($status -eq 'failure') { 'failed' } else { $status }
+          $title = "[Pipeline Incident] $sourceWorkflow $titleStatus on $refName"
+
+          "enabled=$($enabled.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "auto_close_on_success=$($autoCloseOnSuccess.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "source_workflow=$sourceWorkflow" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "status=$status" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "ref_name=$refName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "run_url=$runUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "incident_key=$incidentKey" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "issue_title=$title" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "labels_json=$($labels | ConvertTo-Json -Compress)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "assignees_json=$($assignees | ConvertTo-Json -Compress)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "config_found=$($configFound.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upsert incident issue
+        if: >
+          steps.policy.outputs.enabled == 'true' &&
+          (steps.policy.outputs.status == 'failure' || steps.policy.outputs.status == 'cancelled')
+        uses: actions/github-script@v8
+        env:
+          SOURCE_WORKFLOW: ${{ steps.policy.outputs.source_workflow }}
+          STATUS: ${{ steps.policy.outputs.status }}
+          REF_NAME: ${{ steps.policy.outputs.ref_name }}
+          RUN_URL: ${{ steps.policy.outputs.run_url }}
+          SUMMARY: ${{ inputs.summary }}
+          INCIDENT_KEY: ${{ steps.policy.outputs.incident_key }}
+          ISSUE_TITLE: ${{ steps.policy.outputs.issue_title }}
+          LABELS_JSON: ${{ steps.policy.outputs.labels_json }}
+          ASSIGNEES_JSON: ${{ steps.policy.outputs.assignees_json }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const marker = `<!-- incident-key: ${process.env.INCIDENT_KEY} -->`;
+            const labels = JSON.parse(process.env.LABELS_JSON || '["pipeline-incident"]');
+            const assignees = JSON.parse(process.env.ASSIGNEES_JSON || '[]');
+
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              labels: 'pipeline-incident',
+              per_page: 100
+            });
+
+            const existing = issues.find((issue) => !issue.pull_request && (issue.body || '').includes(marker));
+
+            const summaryText = (process.env.SUMMARY || '').trim();
+            const details = [
+              '### Latest occurrence',
+              `- Status: ${process.env.STATUS}`,
+              `- Workflow: ${process.env.SOURCE_WORKFLOW}`,
+              `- Ref: ${process.env.REF_NAME}`,
+              `- Run: ${process.env.RUN_URL}`
+            ];
+
+            if (summaryText) {
+              details.push('', '```json', summaryText, '```');
+            }
+
+            const commentBody = details.join('\n');
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: existing.number,
+                body: commentBody
+              });
+              core.info(`Updated existing incident issue #${existing.number}.`);
+              return;
+            }
+
+            const bodyLines = [
+              marker,
+              '',
+              '## Pipeline incident opened automatically',
+              '',
+              commentBody,
+              '',
+              'This issue is deduplicated by workflow, ref, and status bucket.'
+            ];
+
+            const created = await github.rest.issues.create({
+              owner,
+              repo,
+              title: process.env.ISSUE_TITLE,
+              body: bodyLines.join('\n'),
+              labels,
+              assignees
+            });
+
+            core.info(`Created incident issue #${created.data.number}.`);
+
+      - name: Summarize incident automation status
+        shell: pwsh
+        run: |
+          @(
+            "## Incident Automation"
+            "- Enabled: ${{ steps.policy.outputs.enabled }}"
+            "- Source workflow: ${{ steps.policy.outputs.source_workflow }}"
+            "- Status: ${{ steps.policy.outputs.status }}"
+            "- Ref: ${{ steps.policy.outputs.ref_name }}"
+            "- Incident key: ${{ steps.policy.outputs.incident_key }}"
+            "- Config file found: ${{ steps.policy.outputs.config_found }}"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+

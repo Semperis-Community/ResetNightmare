@@ -7,14 +7,450 @@ permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: changelog-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  changelog:
-    if: ${{ vars.PIPELINE_ENABLED == 'true' }}
-    uses: Semperis-Community/.github/.github/workflows/changelog-reusable.yaml@v1.0.0
+  update-changelog:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Resolve release notes payload
+        id: notes
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            let tagName = context.eventName === 'release'
+              ? context.payload.release.tag_name
+              : '';
+
+            if (!tagName) {
+              const releases = await github.paginate(github.rest.repos.listReleases, {
+                owner,
+                repo,
+                per_page: 100
+              });
+
+              const latestPublished = releases.find((rel) => rel.draft === false);
+              if (latestPublished) {
+                tagName = latestPublished.tag_name;
+                core.info(`No manual tag provided; using latest release tag '${tagName}'.`);
+              }
+            }
+
+            if (!tagName) {
+              core.setFailed('No tag value provided.');
+              return;
+            }
+
+            let previousTag = '';
+
+            if (!previousTag) {
+              const releases = await github.paginate(github.rest.repos.listReleases, {
+                owner,
+                repo,
+                per_page: 100
+              });
+
+              const index = releases.findIndex((rel) => rel.tag_name === tagName);
+              if (index >= 0 && index + 1 < releases.length) {
+                previousTag = releases[index + 1].tag_name;
+              }
+            }
+
+            const payload = {
+              owner,
+              repo,
+              tag_name: tagName
+            };
+
+            if (previousTag) {
+              payload.previous_tag_name = previousTag;
+            }
+
+            const generated = await github.rest.repos.generateReleaseNotes(payload);
+            core.setOutput('tag_name', tagName);
+            core.setOutput('previous_tag', previousTag);
+            core.setOutput('body', generated.data.body || 'No release notes generated.');
+
+      - name: Resolve target branch
+        id: target
+        run: |
+          echo "branch=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure changelog file exists
+        run: |
+          if [ ! -f CHANGELOG.md ]; then
+            printf '%s\n\n%s\n' \
+              '# Changelog' \
+              'All notable changes to this project will be documented in this file.' \
+              > CHANGELOG.md
+          fi
+
+      - name: Update changelog content
+        env:
+          TAG_NAME: ${{ steps.notes.outputs.tag_name }}
+          NOTES_BODY: ${{ steps.notes.outputs.body }}
+          TARGET_BRANCH: ${{ steps.target.outputs.branch }}
+        run: |
+          python - <<'PY'
+          import datetime as dt
+          import os
+          import re
+          from pathlib import Path
+
+          tag = os.environ['TAG_NAME'].strip()
+          body = os.environ['NOTES_BODY'].strip()
+          target_branch = os.environ.get('TARGET_BRANCH', '').strip() or 'main'
+
+          changelog_path = Path('CHANGELOG.md')
+          text = changelog_path.read_text(encoding='utf-8') if changelog_path.exists() else ''
+
+          def extract_release_prs(notes_body: str):
+            entries = {}
+            line_pattern = re.compile(
+              r'^\*\s+(?P<title>.+?)\s+by\s+@[^\s]+\s+in\s+https://github\.com/[^/]+/[^/]+/pull/(?P<num>\d+)\s*$',
+              re.IGNORECASE,
+            )
+            pr_url_pattern = re.compile(r'https://github\.com/[^/]+/[^/]+/pull/(?P<num>\d+)', re.IGNORECASE)
+
+            for raw_line in notes_body.splitlines():
+              line = raw_line.strip()
+              if not line:
+                continue
+
+              match = line_pattern.match(line)
+              if match:
+                pr_num = int(match.group('num'))
+                title = match.group('title').strip()
+                entries[pr_num] = title
+                continue
+
+              for url_match in pr_url_pattern.finditer(line):
+                pr_num = int(url_match.group('num'))
+                entries.setdefault(pr_num, f'PR #{pr_num}')
+
+            return entries
+
+          def build_header(existing_lines):
+            if existing_lines:
+              return existing_lines
+            return [
+              '# Changelog',
+              '',
+              'All notable changes to this project are documented in this file.',
+              '',
+              'Entries are maintained in pull-request history format by the changelog workflow.',
+              '',
+              '## Pull Request History',
+              '',
+              'Deduplicated historical PR records, newest first, with key details retained.',
+              '',
+            ]
+
+          lines = text.splitlines()
+
+          first_pr_index = None
+          for idx, line in enumerate(lines):
+            if re.match(r'^### PR #(\d+) - ', line):
+              first_pr_index = idx
+              break
+
+          header_lines = build_header(lines[:first_pr_index] if first_pr_index is not None else lines)
+          if not any(line.strip() == '## Pull Request History' for line in header_lines):
+            if header_lines and header_lines[-1].strip() != '':
+              header_lines.append('')
+            header_lines.extend([
+              '## Pull Request History',
+              '',
+              'Deduplicated historical PR records, newest first, with key details retained.',
+              '',
+            ])
+
+          entry_starts = []
+          for idx, line in enumerate(lines):
+            match = re.match(r'^### PR #(\d+) - (.+)$', line)
+            if match:
+              entry_starts.append((idx, int(match.group(1)), match.group(2).strip()))
+
+          sections = {}
+          had_release_field = False
+          for pos, (start_idx, pr_num, title) in enumerate(entry_starts):
+            end_idx = entry_starts[pos + 1][0] if pos + 1 < len(entry_starts) else len(lines)
+            section = lines[start_idx:end_idx]
+
+            data = {
+              'title': title,
+                'source': f'#{pr_num}',
+              'base': target_branch,
+              'head': 'unknown',
+              'date': '',
+              'details': [],
+            }
+
+            in_details = False
+            for row in section[1:]:
+              stripped = row.strip()
+              if not stripped:
+                continue
+              if stripped.startswith('- Source PR:'):
+                data['source'] = stripped.split(':', 1)[1].strip()
+                in_details = False
+              elif stripped.startswith('- Base branch:'):
+                data['base'] = stripped.split(':', 1)[1].strip()
+                in_details = False
+              elif stripped.startswith('- Head branch:'):
+                data['head'] = stripped.split(':', 1)[1].strip()
+                in_details = False
+              elif stripped.startswith('- Date:'):
+                data['date'] = stripped.split(':', 1)[1].strip()
+                in_details = False
+              elif stripped.startswith('- Release:'):
+                had_release_field = True
+                in_details = False
+              elif stripped == '- Details:':
+                in_details = True
+              elif in_details and stripped.startswith('- '):
+                detail = stripped[2:].strip()
+                if detail and detail not in data['details']:
+                  data['details'].append(detail)
+              elif in_details and stripped.startswith('* '):
+                detail = stripped[2:].strip()
+                if detail and detail not in data['details']:
+                  data['details'].append(detail)
+
+            sections[pr_num] = data
+
+          release_prs = extract_release_prs(body)
+          today = dt.datetime.utcnow().strftime('%Y-%m-%d')
+
+          changed = had_release_field
+          for pr_num, release_title in release_prs.items():
+            if pr_num not in sections:
+              sections[pr_num] = {
+                'title': release_title,
+                'source': f'#{pr_num}',
+                'base': target_branch,
+                'head': 'unknown',
+                'date': f'{today} (released)',
+                'details': ['Captured from generated release notes.'],
+              }
+              changed = True
+              continue
+
+            entry = sections[pr_num]
+            if entry['title'].startswith('PR #') and release_title:
+              entry['title'] = release_title
+              changed = True
+
+            if not entry['date']:
+              entry['date'] = f'{today} (released)'
+              changed = True
+
+          if not release_prs and not had_release_field:
+            print(f'No pull requests found in generated release notes for {tag}; no update needed.')
+            raise SystemExit(0)
+
+          if not changed:
+            print(f'Changelog already up to date for release {tag}; no update needed.')
+            raise SystemExit(0)
+
+          output = [line.rstrip() for line in header_lines]
+          if output and output[-1] != '':
+            output.append('')
+
+          for pr_num in sorted(sections.keys(), reverse=True):
+            entry = sections[pr_num]
+            output.append(f"### PR #{pr_num} - {entry['title']}")
+            output.append('')
+            output.append(f"- Source PR: {entry['source']}")
+            output.append(f"- Base branch: {entry['base']}")
+            output.append(f"- Head branch: {entry['head']}")
+            if entry['date']:
+              output.append(f"- Date: {entry['date']}")
+            output.append('- Details:')
+
+            if entry['details']:
+              for detail in entry['details']:
+                output.append(f"  - {detail}")
+            else:
+              output.append('  - No additional details recorded.')
+
+            output.append('')
+
+          changelog_path.write_text('\n'.join(output).rstrip() + '\n', encoding='utf-8')
+          print(f"Updated structured changelog entries for release {tag}.")
+          PY
+
+      - name: Resolve release PR approval policy
+        id: approval-policy
+        if: ${{ steps.target.outputs.branch == 'main' }}
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const targetBranch = `${{ steps.target.outputs.branch }}`;
+
+            const repoInfo = await github.rest.repos.get({ owner, repo });
+            const visibility = repoInfo.data.private ? 'private' : 'public';
+
+            let hasCodeowners = false;
+            const candidates = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'];
+            for (const candidate of candidates) {
+              try {
+                await github.rest.repos.getContent({ owner, repo, path: candidate, ref: targetBranch });
+                hasCodeowners = true;
+                core.info(`Found CODEOWNERS file at '${candidate}' on branch '${targetBranch}'.`);
+                break;
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+              }
+            }
+
+            const requiresManualApproval = visibility === 'public' || hasCodeowners;
+            core.setOutput('repo_visibility', visibility);
+            core.setOutput('has_codeowners', hasCodeowners ? 'true' : 'false');
+            core.setOutput('requires_manual_approval', requiresManualApproval ? 'true' : 'false');
+
+      - name: Commit changelog update
+        id: commit
+        if: ${{ steps.target.outputs.branch == 'main' }}
+        env:
+          TAG_NAME: ${{ steps.notes.outputs.tag_name }}
+        run: |
+          branch_name="automation/changelog-${TAG_NAME}-${GITHUB_RUN_ID}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "$branch_name"
+          git add CHANGELOG.md
+
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "branch_name=$branch_name" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "docs(changelog): update for ${TAG_NAME}"
+          git push --set-upstream origin "$branch_name"
+
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          echo "branch_name=$branch_name" >> "$GITHUB_OUTPUT"
+
+      - name: Create release changelog PR
+        id: create-pr
+        if: ${{ steps.target.outputs.branch == 'main' && steps.commit.outputs.has_changes == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ steps.notes.outputs.tag_name }}
+          TARGET_BRANCH: ${{ steps.target.outputs.branch }}
+          BRANCH_NAME: ${{ steps.commit.outputs.branch_name }}
+          REPO_VISIBILITY: ${{ steps.approval-policy.outputs.repo_visibility }}
+          HAS_CODEOWNERS: ${{ steps.approval-policy.outputs.has_codeowners }}
+          REQUIRES_MANUAL_APPROVAL: ${{ steps.approval-policy.outputs.requires_manual_approval }}
+        run: |
+          pr_body=$(cat <<EOF
+          This automated PR updates CHANGELOG.md for ${TAG_NAME} using generated release notes.
+
+          Approval policy:
+          - Repository visibility: ${REPO_VISIBILITY}
+          - CODEOWNERS present: ${HAS_CODEOWNERS}
+          - Manual approval required: ${REQUIRES_MANUAL_APPROVAL}
+          EOF
+          )
+
+          pr_url=$(gh pr create \
+            --base "$TARGET_BRANCH" \
+            --head "$BRANCH_NAME" \
+            --title "release(changelog): update for ${TAG_NAME}" \
+            --body "$pr_body" \
+            --label automation \
+            --label changelog)
+
+          pr_number=$(gh pr view "$pr_url" --json number --jq '.number')
+
+          echo "pull-request-url=$pr_url" >> "$GITHUB_OUTPUT"
+          echo "pull-request-number=$pr_number" >> "$GITHUB_OUTPUT"
+
+      - name: Auto-merge release changelog PR when approval is not required
+        if: ${{ steps.target.outputs.branch == 'main' && steps.approval-policy.outputs.requires_manual_approval == 'false' && steps.create-pr.outputs.pull-request-number != '' }}
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = Number('${{ steps.create-pr.outputs.pull-request-number }}');
+
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
+              core.info('No pull request number available; skipping auto-merge.');
+              return;
+            }
+
+            try {
+              await github.rest.pulls.merge({
+                owner,
+                repo,
+                pull_number: prNumber,
+                merge_method: 'squash'
+              });
+              core.info(`Merged changelog PR #${prNumber} because manual approval is not required.`);
+            } catch (error) {
+              core.warning(`Unable to auto-merge changelog PR #${prNumber}: ${error.message}`);
+            }
+
+      - name: Summarize release PR status
+        if: ${{ steps.target.outputs.branch == 'main' }}
+        run: |
+          {
+            echo "## Changelog Release PR"
+            echo "- Target branch: ${{ steps.target.outputs.branch }}"
+            echo "- PR URL: ${{ steps.create-pr.outputs.pull-request-url || 'none (no changes detected)' }}"
+            echo "- Manual approval required: ${{ steps.approval-policy.outputs.requires_manual_approval }}"
+            echo "- Repository visibility: ${{ steps.approval-policy.outputs.repo_visibility }}"
+            echo "- CODEOWNERS present: ${{ steps.approval-policy.outputs.has_codeowners }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify:
+    # Send notifications for changelog workflow failure or cancellation.
+    if: ${{ always() }}
+    needs:
+      - update-changelog
+    uses: ./.github/workflows/notify.yaml
     with:
-      target_branch: ${{ github.ref_name }}
-      changelog_file: CHANGELOG.md
-      notify_config_file: pipeline-config/ref/notify.yaml
-      incident_config_file: pipeline-config/ref/incidents.yaml
-      workflow_contract_version: 1.0.0
+      source_workflow: changelog
+      status: ${{ needs.update-changelog.result == 'failure' && 'failure' || (needs.update-changelog.result == 'cancelled' && 'cancelled' || 'success') }}
+      ref: ${{ github.ref_name }}
+      run_url: ${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+      summary: ${{ toJson(needs) }}
+      notify_on_success: false
     secrets: inherit
+
+  incident:
+    # Open or update deduplicated pipeline incident issues for failures/cancellations.
+    if: ${{ always() && (needs.update-changelog.result == 'failure' || needs.update-changelog.result == 'cancelled') }}
+    needs:
+      - update-changelog
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/incident.yaml
+    with:
+      source_workflow: changelog
+      status: ${{ needs.update-changelog.result == 'failure' && 'failure' || (needs.update-changelog.result == 'cancelled' && 'cancelled' || 'success') }}
+      ref: ${{ github.ref_name }}
+      run_url: ${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+      summary: ${{ toJson(needs) }}

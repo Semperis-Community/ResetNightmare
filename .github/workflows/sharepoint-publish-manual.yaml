@@ -22,8 +22,7 @@ permissions:
 
 jobs:
   publish-sharepoint:
-    if: ${{ vars.PIPELINE_ENABLED == 'true' }}
-    uses: Semperis-Community/.github/.github/workflows/sharepoint-publish-reusable.yaml@v1.0.0
+    uses: ./.github/workflows/sharepoint-publish-release.yaml
     with:
       release-tag: ${{ inputs['release-tag'] }}
       release-stage: ${{ inputs['release-stage'] }}

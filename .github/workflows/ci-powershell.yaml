@@ -1,4 +1,4 @@
-name: CI PowerShell Wrapper
+name: CI PowerShell
 
 on:
   workflow_call:
@@ -13,10 +13,86 @@ on:
         default: pipeline-config/ref/test-dependencies.yaml
 
 jobs:
-  ci-powershell:
-    if: ${{ vars.PIPELINE_ENABLED == 'true' }}
-    uses: Semperis-Community/.github/.github/workflows/ci-powershell-reusable.yaml@v1.0.0
-    with:
-      ref: ${{ inputs.ref }}
-      dependency-file: ${{ inputs['dependency-file'] }}
-    secrets: inherit
+  lint-and-test-powershell:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup PowerShell tools
+        uses: ./.github/actions/setup-powershell-tools
+        with:
+          modules: PSScriptAnalyzer,Pester
+          dependency-file: ${{ inputs.dependency-file }}
+
+      - name: Validate PowerShell script and cmdlet help
+        shell: pwsh
+        run: |
+          ./.github/internal/scripts/Validate-PowerShellHelp.ps1 -Root .
+
+      - name: Enforce PowerShell formatting
+        shell: pwsh
+        run: |
+          $formatRules = @(
+            "PSUseConsistentIndentation"
+            "PSPlaceOpenBrace"
+            "PSPlaceCloseBrace"
+            "PSUseConsistentWhitespace"
+          )
+
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./.github/powershell-formatting.psd1 -IncludeRule $formatRules
+          if ($results) {
+            $results | Select-Object RuleName, Severity, ScriptName, Line, Message | Format-Table -AutoSize
+            throw "PowerShell formatting violations detected."
+          }
+
+      - name: Lint with PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
+          if ($results) {
+            $results | Format-Table -AutoSize
+            throw "PSScriptAnalyzer found errors."
+          }
+
+      - name: Verify Pester 5 is installed
+        shell: pwsh
+        run: |
+          $pesterModule = Get-Module -ListAvailable Pester |
+            Sort-Object Version -Descending |
+            Select-Object -First 1
+
+          if ($null -eq $pesterModule) {
+            throw "Pester module was not found after setup-powershell-tools."
+          }
+
+          if ($pesterModule.Version.Major -ne 5) {
+            throw "Pester 5 is required. Detected version: $($pesterModule.Version)."
+          }
+
+          Write-Host "Using Pester version $($pesterModule.Version)."
+
+      - name: Run Pester tests
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "./Tests")) {
+            Write-Host "No ./Tests folder found, skipping Pester."
+            exit 0
+          }
+
+          $config = New-PesterConfiguration
+          $config.Run.Path = "./Tests"
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputPath = "test-results.xml"
+          Invoke-Pester -Configuration $config
+
+      - name: Upload test results
+        if: always() && hashFiles('test-results.xml') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: pester-results
+          path: test-results.xml
+

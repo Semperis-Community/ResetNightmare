@@ -1,4 +1,4 @@
-name: CI Python Wrapper
+name: CI Python
 
 on:
   workflow_call:
@@ -13,10 +13,121 @@ on:
         default: pipeline-config/ref/test-dependencies.yaml
 
 jobs:
-  ci-python:
-    if: ${{ vars.PIPELINE_ENABLED == 'true' }}
-    uses: Semperis-Community/.github/.github/workflows/ci-python-reusable.yaml@v1.0.0
-    with:
-      ref: ${{ inputs.ref }}
-      dependency-file: ${{ inputs['dependency-file'] }}
-    secrets: inherit
+  lint-and-test-python:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Detect Python project content
+        id: detect
+        shell: pwsh
+        run: |
+          $hasSource = @(Get-ChildItem -Path . -Recurse -File -Include *.py -ErrorAction SilentlyContinue).Count -gt 0
+          $hasMetadata = (Test-Path "requirements.txt") -or (Test-Path "pyproject.toml") -or (Test-Path "setup.py") -or (Test-Path "setup.cfg")
+          $hasProject = $hasSource -or $hasMetadata
+
+          "has_project=$($hasProject.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Install Python tooling and dependencies
+        if: steps.detect.outputs.has_project == 'true'
+        shell: pwsh
+        run: |
+          $dependencyFile = "${{ inputs.dependency-file }}"
+          $extraIndexArgs = @()
+          if (Test-Path $dependencyFile) {
+          if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+              if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+                Register-PSRepository -Default -ErrorAction Stop
+              }
+              Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+              Import-Module powershell-yaml -ErrorAction Stop
+            }
+
+            $dependencyConfig = Get-Content -Path $dependencyFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+            $pythonIndexes = @()
+            if ($null -ne $dependencyConfig.pythonIndexes) {
+              $pythonIndexes = @($dependencyConfig.pythonIndexes)
+            }
+
+            foreach ($index in $pythonIndexes) {
+              if ([string]::IsNullOrWhiteSpace($index.url) -eq $false) {
+                $extraIndexArgs += @("--extra-index-url", $index.url)
+              }
+            }
+          }
+
+          python -m pip install --upgrade pip
+          & python -m pip install ruff pytest build @extraIndexArgs
+
+          if (Test-Path "requirements.txt") {
+            & python -m pip install -r requirements.txt @extraIndexArgs
+          }
+          elseif (Test-Path "pyproject.toml") {
+            & python -m pip install . @extraIndexArgs
+          }
+
+      - name: Lint Python code
+        if: steps.detect.outputs.has_project == 'true'
+        shell: pwsh
+        run: |
+          ruff check .
+
+      - name: Run Python tests
+        if: steps.detect.outputs.has_project == 'true'
+        shell: pwsh
+        run: |
+          $testPaths = @()
+          if (Test-Path "Tests") {
+            $testPaths += "Tests"
+          }
+          if (Test-Path "tests") {
+            $testPaths += "tests"
+          }
+
+          if ($testPaths.Count -eq 0) {
+            Write-Host "No Python test directories found. Skipping pytest."
+            exit 0
+          }
+
+          pytest @testPaths --junitxml=python-test-results.xml
+
+      - name: Build Python distributions (validation)
+        if: steps.detect.outputs.has_project == 'true'
+        shell: pwsh
+        run: |
+          if (Test-Path "pyproject.toml" -or Test-Path "setup.py") {
+            python -m build
+          }
+          else {
+            Write-Host "No Python build metadata found. Skipping distribution build validation."
+          }
+
+      - name: Skip when no Python project exists
+        if: steps.detect.outputs.has_project != 'true'
+        shell: pwsh
+        run: |
+          Write-Host "No Python source or project metadata found. Skipping Python validation."
+
+      - name: Upload Python test results
+        if: always() && hashFiles('python-test-results.xml') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-test-results
+          path: python-test-results.xml
+
+      - name: Upload Python build artifacts
+        if: always() && hashFiles('dist/*') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-dist
+          path: dist/*
+
