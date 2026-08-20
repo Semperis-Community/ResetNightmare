@@ -1,4 +1,6 @@
-name: Notify Wrapper
+name: Notify
+
+run-name: Notify | ${{ inputs.source_workflow }} | ${{ inputs.status }}
 
 on:
   workflow_call:
@@ -39,10 +41,6 @@ on:
         required: false
         default: false
         type: boolean
-      notify_config_file:
-        description: Path to the notify policy config file in the repository.
-        required: true
-        type: string
     secrets:
       TEAMS_WEBHOOK_URL:
         required: false
@@ -59,18 +57,555 @@ on:
       EMAIL_TO:
         required: false
 
+permissions:
+  contents: read
+
 jobs:
   notify:
-    if: ${{ vars.PIPELINE_ENABLED == 'true' }}
-    uses: Semperis-Community/.github/.github/workflows/notify-reusable.yaml@v1.0.0
-    with:
-      source_workflow: ${{ inputs.source_workflow }}
-      status: ${{ inputs.status }}
-      ref: ${{ inputs.ref }}
-      run_url: ${{ inputs.run_url }}
-      summary: ${{ inputs.summary }}
-      notify_on_success: ${{ inputs.notify_on_success }}
-      notify_on_success_teams: ${{ inputs.notify_on_success_teams }}
-      notify_on_success_email: ${{ inputs.notify_on_success_email }}
-      notify_config_file: ${{ inputs.notify_config_file }}
-    secrets: inherit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Resolve notification policy
+        id: policy
+        shell: pwsh
+        env:
+          INPUT_SOURCE_WORKFLOW: ${{ inputs.source_workflow }}
+          INPUT_STATUS: ${{ inputs.status }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_RUN_URL: ${{ inputs.run_url }}
+          INPUT_SUMMARY: ${{ inputs.summary }}
+          INPUT_NOTIFY_ON_SUCCESS: ${{ inputs.notify_on_success }}
+          INPUT_NOTIFY_ON_SUCCESS_TEAMS: ${{ inputs.notify_on_success_teams }}
+          INPUT_NOTIFY_ON_SUCCESS_EMAIL: ${{ inputs.notify_on_success_email }}
+        run: |
+          $configPath = "pipeline-config/ref/notify.yaml"
+          $sourceWorkflow = $env:INPUT_SOURCE_WORKFLOW
+          $status = $env:INPUT_STATUS
+          $refName = $env:INPUT_REF
+          $runUrl = $env:INPUT_RUN_URL
+          $summary = $env:INPUT_SUMMARY
+          $notifyOnSuccessInput = $env:INPUT_NOTIFY_ON_SUCCESS
+          $notifyOnSuccessTeamsInput = $env:INPUT_NOTIFY_ON_SUCCESS_TEAMS
+          $notifyOnSuccessEmailInput = $env:INPUT_NOTIFY_ON_SUCCESS_EMAIL
+          $repositoryName = "${{ github.event.repository.name }}"
+
+          if ([string]::IsNullOrWhiteSpace($refName))
+          {
+            $refName = "${{ github.ref_name }}"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($runUrl))
+          {
+            $runUrl = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($repositoryName))
+          {
+            $repositoryName = "${{ github.repository }}".Split('/')[-1]
+          }
+
+          function Convert-ToBool
+          {
+            param(
+              $Value,
+              [bool]$Fallback
+            )
+
+            if ($null -eq $Value)
+            {
+              return $Fallback
+            }
+
+            if ($Value -is [bool])
+            {
+              return [bool]$Value
+            }
+
+            $text = [string]$Value
+            if ([string]::IsNullOrWhiteSpace($text))
+            {
+              return $Fallback
+            }
+
+            switch ($text.Trim().ToLowerInvariant())
+            {
+              'true' { return $true }
+              'false' { return $false }
+              default { return $Fallback }
+            }
+          }
+
+          $enableTeams = $true
+          $enableEmail = $true
+          $notifyOnSuccess = Convert-ToBool -Value $notifyOnSuccessInput -Fallback $false
+          $notifyOnSuccessTeams = Convert-ToBool -Value $notifyOnSuccessTeamsInput -Fallback $notifyOnSuccess
+          $notifyOnSuccessEmail = Convert-ToBool -Value $notifyOnSuccessEmailInput -Fallback $notifyOnSuccess
+          $emailSubjectPrefix = "[$repositoryName]"
+          $configFound = $false
+
+          if (Test-Path -Path $configPath)
+          {
+            $configFound = $true
+
+            if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue))
+            {
+              if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue))
+              {
+                Register-PSRepository -Default -ErrorAction Stop
+              }
+
+              Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+              Import-Module powershell-yaml -ErrorAction Stop
+            }
+
+            $notifyConfig = Get-Content -Path $configPath -Raw | ConvertFrom-Yaml -ErrorAction Stop
+
+            if ($null -ne $notifyConfig.defaults)
+            {
+              $enableTeams = Convert-ToBool -Value $notifyConfig.defaults.enableTeams -Fallback $enableTeams
+              $enableEmail = Convert-ToBool -Value $notifyConfig.defaults.enableEmail -Fallback $enableEmail
+              $notifyOnSuccess = Convert-ToBool -Value $notifyConfig.defaults.notifyOnSuccess -Fallback $notifyOnSuccess
+              $notifyOnSuccessTeams = Convert-ToBool -Value $notifyConfig.defaults.notifyOnSuccessTeams -Fallback $notifyOnSuccess
+              $notifyOnSuccessEmail = Convert-ToBool -Value $notifyConfig.defaults.notifyOnSuccessEmail -Fallback $notifyOnSuccess
+
+              if ([string]::IsNullOrWhiteSpace([string]$notifyConfig.defaults.emailSubjectPrefix) -eq $false)
+              {
+                $emailSubjectPrefix = [string]$notifyConfig.defaults.emailSubjectPrefix
+              }
+            }
+
+            $workflowConfig = $null
+            if ($null -ne $notifyConfig.workflows)
+            {
+              if ($notifyConfig.workflows -is [hashtable])
+              {
+                if ($notifyConfig.workflows.ContainsKey($sourceWorkflow))
+                {
+                  $workflowConfig = $notifyConfig.workflows[$sourceWorkflow]
+                }
+              }
+              else
+              {
+                $workflowProperty = $notifyConfig.workflows.PSObject.Properties[$sourceWorkflow]
+                if ($null -ne $workflowProperty)
+                {
+                  $workflowConfig = $workflowProperty.Value
+                }
+              }
+            }
+
+            if ($null -ne $workflowConfig)
+            {
+              $enableTeams = Convert-ToBool -Value $workflowConfig.enableTeams -Fallback $enableTeams
+              $enableEmail = Convert-ToBool -Value $workflowConfig.enableEmail -Fallback $enableEmail
+              $notifyOnSuccess = Convert-ToBool -Value $workflowConfig.notifyOnSuccess -Fallback $notifyOnSuccess
+              $notifyOnSuccessTeams = Convert-ToBool -Value $workflowConfig.notifyOnSuccessTeams -Fallback $notifyOnSuccess
+              $notifyOnSuccessEmail = Convert-ToBool -Value $workflowConfig.notifyOnSuccessEmail -Fallback $notifyOnSuccess
+
+              if ([string]::IsNullOrWhiteSpace([string]$workflowConfig.emailSubjectPrefix) -eq $false)
+              {
+                $emailSubjectPrefix = [string]$workflowConfig.emailSubjectPrefix
+              }
+            }
+          }
+
+          $emailSubjectPrefix = $emailSubjectPrefix.Replace('{repository}', $repositoryName)
+
+          $shouldNotify = $false
+          $shouldNotifyTeams = $false
+          $shouldNotifyEmail = $false
+          if ($status -eq 'failure' -or $status -eq 'cancelled')
+          {
+            $shouldNotifyTeams = $true
+            $shouldNotifyEmail = $true
+          }
+          elseif ($status -eq 'success')
+          {
+            $shouldNotifyTeams = $notifyOnSuccessTeams
+            $shouldNotifyEmail = $notifyOnSuccessEmail
+          }
+
+          $shouldNotify = $shouldNotifyTeams -or $shouldNotifyEmail
+
+          $color = '#6b7280'
+          if ($status -eq 'success')
+          {
+            $color = '#16a34a'
+          }
+          elseif ($status -eq 'cancelled')
+          {
+            $color = '#ca8a04'
+          }
+          elseif ($status -eq 'failure')
+          {
+            $color = '#dc2626'
+          }
+
+          function Write-GitHubOutput
+          {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$Name,
+
+              [AllowNull()]
+              [string]$Value
+            )
+
+            if ($null -eq $Value)
+            {
+              $Value = ''
+            }
+
+            $delimiter = "EOF_$([guid]::NewGuid().ToString('N'))"
+            @(
+              "$Name<<$delimiter"
+              $Value
+              $delimiter
+            ) | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+          "should_notify=$($shouldNotify.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "source_workflow=$sourceWorkflow" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "status=$status" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "ref_name=$refName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "run_url=$runUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-GitHubOutput -Name 'summary' -Value $summary
+          "enable_teams=$($enableTeams.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "enable_email=$($enableEmail.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "notify_on_success_effective=$($notifyOnSuccess.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "notify_on_success_teams_effective=$($notifyOnSuccessTeams.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "notify_on_success_email_effective=$($notifyOnSuccessEmail.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "should_notify_teams=$($shouldNotifyTeams.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "should_notify_email=$($shouldNotifyEmail.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "email_subject_prefix=$emailSubjectPrefix" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "config_found=$($configFound.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "color=$color" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Send Microsoft Teams notification
+        if: ${{ steps.policy.outputs.should_notify_teams == 'true' && steps.policy.outputs.enable_teams == 'true' }}
+        shell: bash
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          SOURCE_WORKFLOW: ${{ steps.policy.outputs.source_workflow }}
+          STATUS: ${{ steps.policy.outputs.status }}
+          REF_NAME: ${{ steps.policy.outputs.ref_name }}
+          RUN_URL: ${{ steps.policy.outputs.run_url }}
+          SUMMARY: ${{ steps.policy.outputs.summary }}
+          COLOR: ${{ steps.policy.outputs.color }}
+          ACTOR: ${{ github.actor }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$TEAMS_WEBHOOK_URL" ]; then
+            echo "Microsoft Teams webhook not configured. Skipping Teams notification."
+            exit 0
+          fi
+
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+
+          status = os.environ["STATUS"]
+          workflow = os.environ["SOURCE_WORKFLOW"]
+          ref_name = os.environ["REF_NAME"]
+          actor = os.environ["ACTOR"]
+          run_url = os.environ["RUN_URL"]
+          summary_raw = os.environ.get("SUMMARY", "")
+          color = os.environ["COLOR"]
+          webhook = os.environ["TEAMS_WEBHOOK_URL"]
+          run_number = os.environ.get("RUN_NUMBER", "")
+          run_attempt = os.environ.get("RUN_ATTEMPT", "")
+          repository = os.environ.get("REPOSITORY", "")
+          commit_sha = os.environ.get("COMMIT_SHA", "")
+
+          def normalize_summary(raw_text, max_length=700):
+              text = (raw_text or "").strip()
+              if not text:
+                  return "No summary provided."
+
+              try:
+                  parsed = json.loads(text)
+                  if isinstance(parsed, dict):
+                      lines = []
+                      for key in sorted(parsed.keys()):
+                          value = parsed[key]
+                          if isinstance(value, (dict, list)):
+                              value = json.dumps(value, ensure_ascii=True)
+                          lines.append(f"- {key}: {value}")
+                      text = "\n".join(lines)
+                  elif isinstance(parsed, list):
+                      lines = []
+                      for item in parsed[:5]:
+                          if isinstance(item, (dict, list)):
+                              lines.append(f"- {json.dumps(item, ensure_ascii=True)}")
+                          else:
+                              lines.append(f"- {item}")
+                      if len(parsed) > 5:
+                          lines.append(f"- ...and {len(parsed) - 5} more")
+                      text = "\n".join(lines)
+              except json.JSONDecodeError:
+                  pass
+
+              if len(text) > max_length:
+                  return text[: max_length - 35].rstrip() + " ... (truncated; see run for full details)"
+              return text
+
+          status_label = status.upper()
+          status_badge = {
+              "SUCCESS": "SUCCESS",
+              "FAILED": "FAILED",
+              "FAILURE": "FAILED",
+              "CANCELLED": "CANCELLED",
+              "SKIPPED": "SKIPPED",
+          }.get(status_label, status_label)
+
+          status_color = {
+              "FAILED": "Attention",
+              "SUCCESS": "Good",
+              "CANCELLED": "Warning",
+              "SKIPPED": "Accent",
+          }.get(status_badge, "Default")
+
+          summary = normalize_summary(summary_raw)
+          short_sha = commit_sha[:7] if commit_sha else "n/a"
+          commit_url = f"https://github.com/{repository}/commit/{commit_sha}" if repository and commit_sha else run_url
+
+          payload = {
+              "type": "message",
+              "attachments": [
+                {
+                  "contentType": "application/vnd.microsoft.card.adaptive",
+                  "content": {
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard",
+                    "version": "1.4",
+                    "body": [
+                      {
+                        "type": "TextBlock",
+                        "text": f"{workflow}",
+                        "weight": "Bolder",
+                        "size": "Large",
+                        "wrap": True,
+                      },
+                      {
+                        "type": "TextBlock",
+                        "text": f"Status: {status_badge}",
+                        "color": status_color,
+                        "weight": "Bolder",
+                        "spacing": "Small",
+                      },
+                      {
+                        "type": "FactSet",
+                        "facts": [
+                          {"title": "Ref", "value": ref_name},
+                          {"title": "Actor", "value": actor},
+                          {"title": "Repository", "value": repository or "n/a"},
+                          {"title": "Run", "value": f"#{run_number} (attempt {run_attempt})" if run_number and run_attempt else "n/a"},
+                          {"title": "Commit", "value": short_sha},
+                        ],
+                      },
+                      {
+                        "type": "TextBlock",
+                        "text": "Summary",
+                        "weight": "Bolder",
+                        "spacing": "Medium",
+                      },
+                      {
+                        "type": "TextBlock",
+                        "text": summary,
+                        "wrap": True,
+                        "spacing": "Small",
+                      },
+                    ],
+                    "actions": [
+                      {
+                        "type": "Action.OpenUrl",
+                        "title": "View Run",
+                        "url": run_url,
+                      },
+                      {
+                        "type": "Action.OpenUrl",
+                        "title": "View Commit",
+                        "url": commit_url,
+                      },
+                    ],
+                    "msteams": {
+                        "width": "Full"
+                    },
+                  },
+                }
+              ],
+          }
+
+          last_error = None
+          for attempt in range(1, 4):
+              request = urllib.request.Request(
+                  webhook,
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={"Content-Type": "application/json"},
+                  method="POST",
+              )
+
+              try:
+                  with urllib.request.urlopen(request, timeout=15) as response:
+                      if response.status < 300:
+                          break
+                      raise RuntimeError(f"Teams webhook returned HTTP {response.status}")
+              except urllib.error.HTTPError as err:
+                  body = err.read().decode("utf-8", errors="replace") if hasattr(err, "read") else ""
+                  last_error = RuntimeError(
+                      f"Teams webhook HTTP {err.code} on attempt {attempt}. Response: {body[:500]}"
+                  )
+              except Exception as err:
+                  last_error = RuntimeError(f"Teams webhook failed on attempt {attempt}: {err}")
+
+              if attempt < 3:
+                  time.sleep(2 * attempt)
+
+          if last_error:
+              raise last_error
+          PY
+
+      - name: Send email notification
+        if: ${{ steps.policy.outputs.should_notify_email == 'true' && steps.policy.outputs.enable_email == 'true' }}
+        shell: bash
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          SOURCE_WORKFLOW: ${{ steps.policy.outputs.source_workflow }}
+          STATUS: ${{ steps.policy.outputs.status }}
+          REF_NAME: ${{ steps.policy.outputs.ref_name }}
+          RUN_URL: ${{ steps.policy.outputs.run_url }}
+          SUMMARY: ${{ steps.policy.outputs.summary }}
+          ACTOR: ${{ github.actor }}
+          EMAIL_SUBJECT_PREFIX: ${{ steps.policy.outputs.email_subject_prefix }}
+        run: |
+          set -euo pipefail
+
+          missing=0
+          for value in "$SMTP_HOST" "$SMTP_PORT" "$SMTP_USERNAME" "$SMTP_PASSWORD" "$EMAIL_FROM" "$EMAIL_TO"; do
+            if [ -z "$value" ]; then
+              missing=1
+            fi
+          done
+
+          if [ "$missing" -eq 1 ]; then
+            echo "SMTP email settings not fully configured. Skipping email notification."
+            exit 0
+          fi
+
+          python - <<'PY'
+          import os
+          import smtplib
+          from email.message import EmailMessage
+
+          msg = EmailMessage()
+          msg["From"] = os.environ["EMAIL_FROM"]
+          msg["To"] = os.environ["EMAIL_TO"]
+          msg["Subject"] = (
+              f"{os.environ['EMAIL_SUBJECT_PREFIX']} {os.environ['SOURCE_WORKFLOW']} "
+              f"{os.environ['STATUS']} on {os.environ['REF_NAME']}"
+          )
+
+          lines = [
+              f"Workflow: {os.environ['SOURCE_WORKFLOW']}",
+              f"Status: {os.environ['STATUS']}",
+              f"Ref: {os.environ['REF_NAME']}",
+              f"Actor: {os.environ['ACTOR']}",
+              f"Run URL: {os.environ['RUN_URL']}",
+          ]
+
+          summary = os.environ.get("SUMMARY", "").strip()
+          if summary:
+              lines.append(f"Summary: {summary}")
+
+          msg.set_content("\n".join(lines))
+
+          host = os.environ["SMTP_HOST"]
+          port = int(os.environ["SMTP_PORT"])
+          username = os.environ["SMTP_USERNAME"]
+          password = os.environ["SMTP_PASSWORD"]
+
+          with smtplib.SMTP(host, port, timeout=20) as client:
+              client.starttls()
+              client.login(username, password)
+              client.send_message(msg)
+          PY
+
+      - name: Summarize notification routing
+        if: ${{ always() }}
+        shell: bash
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          teams_reason="will send (status requires Teams notification based on policy)"
+          if [ "${{ steps.policy.outputs.enable_teams }}" != "true" ]; then
+            teams_reason="skipped (disabled by effective notify policy)"
+          elif [ "${{ steps.policy.outputs.should_notify_teams }}" != "true" ]; then
+            teams_reason="skipped (status '${{ steps.policy.outputs.status }}' is not configured for Teams success notification)"
+          elif [ -z "$TEAMS_WEBHOOK_URL" ]; then
+            teams_reason="skipped (TEAMS_WEBHOOK_URL is not configured)"
+          fi
+
+          email_reason="will send (status requires email notification based on policy)"
+          if [ "${{ steps.policy.outputs.enable_email }}" != "true" ]; then
+            email_reason="skipped (disabled by effective notify policy)"
+          elif [ "${{ steps.policy.outputs.should_notify_email }}" != "true" ]; then
+            email_reason="skipped (status '${{ steps.policy.outputs.status }}' is not configured for email success notification)"
+          elif [ -z "$SMTP_HOST" ] || [ -z "$SMTP_PORT" ] || [ -z "$SMTP_USERNAME" ] || [ -z "$SMTP_PASSWORD" ] || [ -z "$EMAIL_FROM" ] || [ -z "$EMAIL_TO" ]; then
+            email_reason="skipped (SMTP/email secrets are incomplete)"
+          fi
+
+          {
+            echo "## Notification Routing"
+            echo "- Source workflow: ${{ steps.policy.outputs.source_workflow }}"
+            echo "- Status: ${{ steps.policy.outputs.status }}"
+            echo "- Ref: ${{ steps.policy.outputs.ref_name }}"
+            echo "- Run URL: ${{ steps.policy.outputs.run_url }}"
+            echo "- Config file found: ${{ steps.policy.outputs.config_found }}"
+            echo "- notify_on_success (input): ${{ inputs.notify_on_success }}"
+            echo "- notify_on_success_teams (input): ${{ inputs.notify_on_success_teams }}"
+            echo "- notify_on_success_email (input): ${{ inputs.notify_on_success_email }}"
+            echo "- notify_on_success (effective): ${{ steps.policy.outputs.notify_on_success_effective }}"
+            echo "- notify_on_success_teams (effective): ${{ steps.policy.outputs.notify_on_success_teams_effective }}"
+            echo "- notify_on_success_email (effective): ${{ steps.policy.outputs.notify_on_success_email_effective }}"
+            echo "- Notification attempted: ${{ steps.policy.outputs.should_notify }}"
+            echo "- Teams notification attempted: ${{ steps.policy.outputs.should_notify_teams }}"
+            echo "- Email notification attempted: ${{ steps.policy.outputs.should_notify_email }}"
+            echo "- Teams enabled by config: ${{ steps.policy.outputs.enable_teams }}"
+            echo "- Email enabled by config: ${{ steps.policy.outputs.enable_email }}"
+            if [ -n "$TEAMS_WEBHOOK_URL" ]; then
+              echo "- Teams configured: true"
+            else
+              echo "- Teams configured: false"
+            fi
+            echo "- Teams decision: $teams_reason"
+            if [ -n "$SMTP_HOST" ] && [ -n "$SMTP_PORT" ] && [ -n "$SMTP_USERNAME" ] && [ -n "$SMTP_PASSWORD" ] && [ -n "$EMAIL_FROM" ] && [ -n "$EMAIL_TO" ]; then
+              echo "- Email configured: true"
+            else
+              echo "- Email configured: false"
+            fi
+            echo "- Email decision: $email_reason"
+          } >> "$GITHUB_STEP_SUMMARY"

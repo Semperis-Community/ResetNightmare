@@ -1,0 +1,47 @@
+name: Spell Check
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: spell-check-manual-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  spell-check:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: latest
+
+      - name: Run cspell
+        shell: pwsh
+        run: |
+          $hadIssues = $false
+
+          try {
+            ./scripts/run-cspell.ps1
+          }
+          catch {
+            $hadIssues = $true
+            Write-Warning "cspell reported issues in advisory mode. $($_.Exception.Message)"
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+            $hadIssues = $true
+          }
+
+          if ($hadIssues) {
+            Write-Host "::warning::cspell found issues (advisory mode). Review step output and summary."
+          }
+
+          exit 0

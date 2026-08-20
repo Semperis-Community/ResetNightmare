@@ -1,0 +1,21 @@
+name: Notify Test
+
+run-name: Notify Test | failure
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  notify-test:
+    uses: ./.github/workflows/notify.yaml
+    with:
+      source_workflow: manual-notify-test
+      status: failure
+      ref: ${{ github.ref_name }}
+      run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      summary: Manual notification test triggered by ${{ github.actor }} on ${{ github.ref_name }}.
+      notify_on_success: false
+    secrets: inherit

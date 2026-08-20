@@ -1,11 +1,13 @@
 name: CI
 
-run-name: CI | ${{ github.ref_name }} | Central Wrapper
+run-name: CI | ${{ github.ref_name }} | Hybrid
 
 on:
+  # Run linting and tests on pushes to any branch.
   push:
     branches:
       - "**"
+  # Run PR validation checks during review and also on close for merged packaging.
   pull_request:
     branches:
       - main
@@ -14,25 +16,1529 @@ on:
       - synchronize
       - reopened
       - closed
+  # Allow manual execution from the Actions UI.
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
-  contents: write
-  issues: write
+  # Minimal permission needed for checkout and artifact upload.
+  contents: read
+
+env:
+  # Shared dependency reference file for lint/test setup.
+  TEST_DEPENDENCY_REFERENCE_FILE: pipeline-config/ref/test-dependencies.yaml
+  # Workflow compatibility contract expected by pipeline-config/ref/pipeline.yaml.
+  WORKFLOW_CONTRACT_VERSION: 1.0.0
 
 jobs:
-  ci-core:
-    if: ${{ vars.PIPELINE_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.action != 'closed' || github.event.pull_request.merged == true) }}
-    uses: Semperis-Community/.github/.github/workflows/ci-core-reusable.yaml@v1.0.0
+  validate-repo-structure:
+    # Enforce required repository structure.
+    runs-on: windows-2022
+    outputs:
+      has_dependencies: ${{ steps.dependency_repos.outputs.has_dependencies }}
+      repositories: ${{ steps.dependency_repos.outputs.repositories }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.merge_commit_sha || github.sha }}
+
+      - name: Resolve dependency repositories from config
+        id: dependency_repos
+        shell: pwsh
+        run: |
+          $dependencyFile = "pipeline-config/ref/pkg-dependencies.yaml"
+
+          if (-not (Test-Path $dependencyFile)) {
+            throw "Required package dependency file '$dependencyFile' is missing."
+          }
+
+          $dependencyContent = Get-Content -Path $dependencyFile -Raw
+          $dependencyConfig = $null
+          $canUseYamlCmdlet = $false
+
+          if (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue) {
+            try {
+              $dependencyConfig = $dependencyContent | ConvertFrom-Yaml -ErrorAction Stop
+              $canUseYamlCmdlet = $true
+            }
+            catch {
+              Write-Warning "ConvertFrom-Yaml exists but failed to parse '$dependencyFile': $($_.Exception.Message)"
+            }
+          }
+          else {
+            try {
+              $attempts = 3
+              $yamlLoaded = $false
+              for ($attempt = 1; $attempt -le $attempts; $attempt += 1) {
+                try {
+                  if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+                    Register-PSRepository -Default -ErrorAction Stop
+                  }
+
+                  Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
+                  Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+                  Import-Module powershell-yaml -ErrorAction Stop
+                  $yamlLoaded = $true
+                  break
+                }
+                catch {
+                  if ($attempt -eq $attempts) {
+                    throw
+                  }
+
+                  Write-Warning "powershell-yaml bootstrap attempt $attempt/$attempts failed: $($_.Exception.Message)"
+                }
+              }
+
+              if (-not $yamlLoaded) {
+                throw 'powershell-yaml bootstrap did not complete successfully.'
+              }
+
+              $dependencyConfig = $dependencyContent | ConvertFrom-Yaml -ErrorAction Stop
+              $canUseYamlCmdlet = $true
+            }
+            catch {
+              Write-Warning "Unable to install powershell-yaml from PSGallery. Falling back to regex parsing for repository names. Error: $($_.Exception.Message)"
+            }
+          }
+
+          $repositoryNames = @()
+
+          if ($canUseYamlCmdlet -and $null -ne $dependencyConfig) {
+            foreach ($sectionName in @('powershellRepositories', 'dotnetReleaseRepositories', 'pythonReleaseRepositories')) {
+              $sectionEntries = @($dependencyConfig.$sectionName)
+              foreach ($entry in $sectionEntries) {
+                if (-not [string]::IsNullOrWhiteSpace($entry.name)) {
+                  $repositoryNames += [string]$entry.name
+                }
+              }
+            }
+          }
+          else {
+            $targetSections = @('powershellRepositories', 'dotnetReleaseRepositories', 'pythonReleaseRepositories')
+            $currentSection = ''
+
+            foreach ($line in ($dependencyContent -split "`r?`n")) {
+              if ($line -match '^\s*#') {
+                continue
+              }
+
+              if ($line -match '^(\w+)\s*:') {
+                $candidateSection = [string]$matches[1]
+                if ($targetSections -contains $candidateSection) {
+                  $currentSection = $candidateSection
+                }
+                else {
+                  $currentSection = ''
+                }
+                continue
+              }
+
+              if ([string]::IsNullOrWhiteSpace($currentSection)) {
+                continue
+              }
+
+              if ($line -match '^\s*-\s*name\s*:\s*(.+?)\s*$') {
+                $nameValue = [string]$matches[1]
+                $nameValue = $nameValue -replace '\s+#.*$', ''
+                $nameValue = $nameValue.Trim().Trim('"').Trim("'")
+                if (-not [string]::IsNullOrWhiteSpace($nameValue)) {
+                  $repositoryNames += $nameValue
+                }
+              }
+            }
+          }
+
+          $repositoryNames = @($repositoryNames | Sort-Object -Unique)
+          if ($repositoryNames.Count -eq 0) {
+            @(
+              'has_dependencies=false'
+              'repositories='
+            ) | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+            @(
+              '## Dependency Repositories'
+              "- Config file: $dependencyFile"
+              '- Status: no dependency repositories configured; dependency-specific validation will be skipped.'
+            ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+            exit 0
+          }
+
+          @(
+            'has_dependencies=true'
+            'repositories<<EOF'
+            ($repositoryNames -join "`n")
+            'EOF'
+          ) | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+          @(
+            '## Dependency Repositories'
+            "- Config file: $dependencyFile"
+            "- Resolved repositories: $($repositoryNames -join ', ')"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Summarize workflow context
+        shell: pwsh
+        run: |
+          @(
+            "## Workflow Context"
+            "- Branch: ${{ github.ref_name }}"
+            "- Event: ${{ github.event_name }}"
+            "- Language path: PowerShell"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Require docs directory
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "docs")) {
+            throw "Required directory 'docs' is missing."
+          }
+
+      - name: Validate pipeline config ref and sample consistency
+        shell: pwsh
+        run: |
+          $configRefRoot = "pipeline-config/ref"
+          $configSampleRoot = "pipeline-config/sample"
+
+          if (-not (Test-Path $configRefRoot)) {
+            Write-Host "Directory '$configRefRoot' is missing. Skipping ref/sample consistency validation."
+            exit 0
+          }
+
+          function Convert-ToStructureShape {
+            param(
+              $Node
+            )
+
+            if ($null -eq $Node) {
+              return @{ __type = "null" }
+            }
+
+            if ($Node -is [System.Collections.IDictionary] -or $Node -is [pscustomobject]) {
+              $shape = [ordered]@{ __type = "object" }
+
+              $propertyNames = @()
+              if ($Node -is [System.Collections.IDictionary]) {
+                $propertyNames = $Node.Keys | ForEach-Object { [string]$_ }
+              }
+              else {
+                $propertyNames = $Node.PSObject.Properties.Name
+              }
+
+              foreach ($name in ($propertyNames | Sort-Object -Unique)) {
+                if ($Node -is [System.Collections.IDictionary]) {
+                  $value = $Node[$name]
+                }
+                else {
+                  $value = $Node.PSObject.Properties[$name].Value
+                }
+
+                $shape[$name] = Convert-ToStructureShape -Node $value
+              }
+
+              return $shape
+            }
+
+            if ($Node -is [System.Collections.IEnumerable] -and -not ($Node -is [string])) {
+              $elementShapes = @()
+              foreach ($item in $Node) {
+                $elementShapes += (Convert-ToStructureShape -Node $item | ConvertTo-Json -Depth 100 -Compress)
+              }
+
+              return @{
+                __type = "array"
+                __elements = @($elementShapes | Sort-Object -Unique)
+              }
+            }
+
+            return @{ __type = "scalar" }
+          }
+
+          function Compare-StructureShape {
+            param(
+              $ReferenceShape,
+              $SampleShape
+            )
+
+            function Get-ShapeKeys {
+              param(
+                $Shape
+              )
+
+              if ($Shape -is [System.Collections.IDictionary]) {
+                return @($Shape.Keys | Where-Object { $_ -ne '__type' } | Sort-Object)
+              }
+
+              return @($Shape.PSObject.Properties.Name | Where-Object { $_ -ne '__type' } | Sort-Object)
+            }
+
+            function Get-ShapeChild {
+              param(
+                $Shape,
+                [string]$Key
+              )
+
+              if ($Shape -is [System.Collections.IDictionary]) {
+                return $Shape[$Key]
+              }
+
+              return $Shape.PSObject.Properties[$Key].Value
+            }
+
+            if ($ReferenceShape.__type -ne $SampleShape.__type) {
+              return $false
+            }
+
+            switch ($ReferenceShape.__type) {
+              'array' {
+                if (@($ReferenceShape.__elements).Count -eq 0) {
+                  return $true
+                }
+
+                $referenceElements = @($ReferenceShape.__elements | Sort-Object -Unique)
+                $sampleElements = @($SampleShape.__elements | Sort-Object -Unique)
+                # Sample config may include additional example array shapes.
+                # Require every reference shape to exist in sample, but allow sample supersets.
+                foreach ($referenceElement in $referenceElements) {
+                  if ($sampleElements -notcontains $referenceElement) {
+                    return $false
+                  }
+                }
+
+                return $true
+              }
+
+              'object' {
+                $referenceKeys = Get-ShapeKeys -Shape $ReferenceShape
+                $sampleKeys = Get-ShapeKeys -Shape $SampleShape
+
+                if (@(Compare-Object -ReferenceObject $referenceKeys -DifferenceObject $sampleKeys).Count -ne 0) {
+                  return $false
+                }
+
+                foreach ($key in $referenceKeys) {
+                  if (-not (Compare-StructureShape -ReferenceShape (Get-ShapeChild -Shape $ReferenceShape -Key $key) -SampleShape (Get-ShapeChild -Shape $SampleShape -Key $key))) {
+                    return $false
+                  }
+                }
+
+                return $true
+              }
+
+              default {
+                return $true
+              }
+            }
+          }
+
+          $refRoot = (Resolve-Path $configRefRoot).Path
+          $refFiles = Get-ChildItem -Path $configRefRoot -File -Recurse
+
+          foreach ($refFile in $refFiles) {
+            $relativePath = [System.IO.Path]::GetRelativePath($refRoot, $refFile.FullName)
+            $samplePath = Join-Path $configSampleRoot $relativePath
+
+            if (-not (Test-Path $samplePath)) {
+              throw "Sample file '$samplePath' is missing for '$($refFile.FullName)'."
+            }
+
+            $extension = [System.IO.Path]::GetExtension($refFile.FullName).ToLowerInvariant()
+            if ($extension -in @('.yaml', '.yml')) {
+              if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+                try {
+                  $attempts = 3
+                  for ($attempt = 1; $attempt -le $attempts; $attempt += 1) {
+                    try {
+                      if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+                        Register-PSRepository -Default -ErrorAction Stop
+                      }
+
+                      Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
+                      Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+                      Import-Module powershell-yaml -ErrorAction Stop
+                      break
+                    }
+                    catch {
+                      if ($attempt -eq $attempts) {
+                        throw
+                      }
+
+                      Write-Host "powershell-yaml bootstrap attempt $attempt/$attempts failed: $($_.Exception.Message)"
+                    }
+                  }
+                }
+                catch {
+                  Write-Warning "Unable to install powershell-yaml. Skipping YAML structural comparison for '$relativePath'. Error: $($_.Exception.Message)"
+                  continue
+                }
+              }
+
+              try {
+                $refNode = Get-Content -Path $refFile.FullName -Raw | ConvertFrom-Yaml -ErrorAction Stop
+              }
+              catch {
+                throw "Unable to parse YAML reference file '$($refFile.FullName)': $($_.Exception.Message)"
+              }
+
+              try {
+                $sampleNode = Get-Content -Path $samplePath -Raw | ConvertFrom-Yaml -ErrorAction Stop
+              }
+              catch {
+                throw "Unable to parse YAML sample file '$samplePath': $($_.Exception.Message)"
+              }
+            }
+            else {
+              $refNode = Get-Content -Path $refFile.FullName -Raw
+              $sampleNode = Get-Content -Path $samplePath -Raw
+            }
+
+            $refShape = Convert-ToStructureShape -Node $refNode
+            $sampleShape = Convert-ToStructureShape -Node $sampleNode
+
+            if (-not (Compare-StructureShape -ReferenceShape $refShape -SampleShape $sampleShape)) {
+              throw "Sample file '$samplePath' does not match the structure of '$($refFile.FullName)'. Values may differ, but keys/nesting must align."
+            }
+          }
+
+      - name: Validate pipeline config contract versions
+        shell: pwsh
+        run: |
+          $pipelineConfigFile = "pipeline-config/ref/pipeline.yaml"
+          if (-not (Test-Path $pipelineConfigFile)) {
+            throw "Required pipeline config '$pipelineConfigFile' is missing."
+          }
+
+          if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+            $attempts = 3
+            for ($attempt = 1; $attempt -le $attempts; $attempt += 1) {
+              try {
+                if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+                  Register-PSRepository -Default -ErrorAction Stop
+                }
+
+                Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
+                Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+                Import-Module powershell-yaml -ErrorAction Stop
+                break
+              }
+              catch {
+                if ($attempt -eq $attempts) {
+                  throw
+                }
+
+                Write-Host "powershell-yaml bootstrap attempt $attempt/$attempts failed: $($_.Exception.Message)"
+              }
+            }
+          }
+
+          $pipelineConfig = Get-Content -Path $pipelineConfigFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+          if ([string]::IsNullOrWhiteSpace($pipelineConfig.configVersion)) {
+            throw "Pipeline config '$pipelineConfigFile' must define 'configVersion'."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($pipelineConfig.workflowContractVersion)) {
+            throw "Pipeline config '$pipelineConfigFile' must define 'workflowContractVersion'."
+          }
+
+          $semVerPattern = '^\d+\.\d+\.\d+$'
+          if ($pipelineConfig.configVersion -notmatch $semVerPattern) {
+            throw "configVersion '$($pipelineConfig.configVersion)' in '$pipelineConfigFile' must use semantic versioning (MAJOR.MINOR.PATCH)."
+          }
+
+          if ($pipelineConfig.workflowContractVersion -notmatch $semVerPattern) {
+            throw "workflowContractVersion '$($pipelineConfig.workflowContractVersion)' in '$pipelineConfigFile' must use semantic versioning (MAJOR.MINOR.PATCH)."
+          }
+
+          $supportedConfigVersions = @('1.0.0')
+          if ($pipelineConfig.configVersion -notin $supportedConfigVersions) {
+            throw "Unsupported configVersion '$($pipelineConfig.configVersion)' in '$pipelineConfigFile'. Supported versions: $($supportedConfigVersions -join ', ')."
+          }
+
+          $expectedContractVersion = "${{ env.WORKFLOW_CONTRACT_VERSION }}"
+          if ($pipelineConfig.workflowContractVersion -ne $expectedContractVersion) {
+            throw "workflowContractVersion '$($pipelineConfig.workflowContractVersion)' does not match CI workflow contract '$expectedContractVersion'."
+          }
+
+          @(
+            "## Pipeline Config Versioning"
+            "- configVersion: $($pipelineConfig.configVersion)"
+            "- workflowContractVersion: $($pipelineConfig.workflowContractVersion)"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+  spell-check:
+    # Check spelling in docs and source comments/files.
+    needs: validate-repo-structure
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.merge_commit_sha || github.sha }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: latest
+
+      - name: Run cspell
+        if: github.event_name == 'pull_request'
+        shell: pwsh
+        run: |
+          ./scripts/run-cspell.ps1
+
+      - name: Run cspell (advisory)
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          $hadIssues = $false
+
+          try {
+            ./scripts/run-cspell.ps1
+          }
+          catch {
+            $hadIssues = $true
+            Write-Warning "cspell reported issues in advisory mode. $($_.Exception.Message)"
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+            $hadIssues = $true
+          }
+
+          if ($hadIssues) {
+            Write-Host "::warning::cspell found issues (advisory mode). Review step output and summary."
+          }
+
+          exit 0
+
+  markdownlint:
+    # Check repository markdown formatting separately from spelling.
+    needs: validate-repo-structure
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.merge_commit_sha || github.sha }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: latest
+
+      - name: Run markdownlint
+        if: github.event_name == 'pull_request'
+        shell: pwsh
+        run: |
+          $markdownlintArgs = @(
+            "--yes"
+            "markdownlint-cli2"
+            "README.md"
+            "docs/**/*.md"
+          )
+
+          & npx @markdownlintArgs
+
+      - name: Run markdownlint (advisory)
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          $markdownlintArgs = @(
+            "--yes"
+            "markdownlint-cli2"
+            "README.md"
+            "docs/**/*.md"
+          )
+
+          $hadIssues = $false
+
+          try {
+            & npx @markdownlintArgs
+            if ($LASTEXITCODE -ne 0) {
+              $hadIssues = $true
+            }
+          }
+          catch {
+            $hadIssues = $true
+            Write-Warning "markdownlint reported issues in advisory mode. $($_.Exception.Message)"
+          }
+
+          if ($hadIssues) {
+            Write-Host "::warning::markdownlint found issues (advisory mode). Review step output."
+          }
+
+          exit 0
+
+  action-version-audit:
+    # Enforce action pinning policy for workflow and local action definitions.
+    needs: validate-repo-structure
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.merge_commit_sha || github.sha }}
+
+      - name: Validate action version pinning
+        shell: pwsh
+        run: |
+          ./scripts/audit-action-pinning.ps1
+
+  actionlint:
+    # Validate GitHub Actions syntax and expression scope in workflow files.
+    needs: validate-repo-structure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.merge_commit_sha || github.sha }}
+
+      - name: Run actionlint
+        shell: pwsh
+        run: |
+          ./scripts/run-actionlint.ps1
+
+  security-scan:
+    # Scan repository content for leaked credentials/secrets before packaging.
+    needs: validate-repo-structure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.merge_commit_sha || github.sha }}
+
+      - name: Install gitleaks CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION="8.24.2"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o gitleaks.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          chmod +x gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+
+      - name: Run gitleaks scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          gitleaks detect --source . --no-git --redact --verbose
+
+  changes:
+    # Detect non-PowerShell language areas changed so optional jobs run only when relevant.
+    needs: validate-repo-structure
+    runs-on: windows-2022
+    outputs:
+      dotnet: ${{ steps.filter.outputs.dotnet }}
+      python: ${{ steps.filter.outputs.python }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.merge_commit_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: filter
+        shell: pwsh
+        run: |
+          $eventName = "${{ github.event_name }}"
+
+          $dotnetPatterns = @(
+            ".github/actions/**"
+            ".github/workflows/**"
+            "**/*.cs"
+            "**/*.sln"
+            "**/*.csproj"
+            "**/*.props"
+            "**/*.targets"
+          )
+
+          $pythonPatterns = @(
+            ".github/actions/**"
+            ".github/workflows/**"
+            "**/*.py"
+            "requirements.txt"
+            "pyproject.toml"
+            "poetry.lock"
+            "setup.py"
+            "setup.cfg"
+            "tox.ini"
+          )
+
+          function Test-MatchAny {
+            param(
+              [string]$Path,
+              [string[]]$Patterns
+            )
+
+            foreach ($pattern in $Patterns) {
+              if ($Path -like $pattern) {
+                return $true
+              }
+            }
+
+            return $false
+          }
+
+          $dotnetChanged = $false
+          $pythonChanged = $false
+
+          if ($eventName -eq "workflow_dispatch") {
+            # Manual runs validate optional language paths by default.
+            $dotnetChanged = $true
+            $pythonChanged = $true
+          }
+          else {
+            if ($eventName -eq "pull_request") {
+              $baseSha = "${{ github.event.pull_request.base.sha }}"
+              $headSha = "${{ github.event.pull_request.head.sha }}"
+            }
+            else {
+              $baseSha = "${{ github.event.before }}"
+              $headSha = "${{ github.sha }}"
+            }
+
+            $changedFiles = @()
+            if ([string]::IsNullOrWhiteSpace($baseSha) -or $baseSha -match '^0+$') {
+              $changedFiles = @(git ls-files)
+            }
+            else {
+              $changedFiles = @(git diff --name-only $baseSha $headSha)
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "Unable to diff $baseSha..$headSha; falling back to repository file list."
+                $changedFiles = @(git ls-files)
+              }
+            }
+
+            foreach ($file in $changedFiles) {
+              $normalizedPath = ([string]$file).Replace('\\', '/')
+
+              if (-not $dotnetChanged -and (Test-MatchAny -Path $normalizedPath -Patterns $dotnetPatterns)) {
+                $dotnetChanged = $true
+              }
+
+              if (-not $pythonChanged -and (Test-MatchAny -Path $normalizedPath -Patterns $pythonPatterns)) {
+                $pythonChanged = $true
+              }
+
+              if ($dotnetChanged -and $pythonChanged) {
+                break
+              }
+            }
+          }
+
+          "dotnet=$($dotnetChanged.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "python=$($pythonChanged.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Summarize workflow context
+        shell: pwsh
+        run: |
+          $languages = New-Object System.Collections.Generic.List[string]
+          $optionalPaths = New-Object System.Collections.Generic.List[string]
+
+          $languages.Add('PowerShell')
+
+          if ('${{ steps.filter.outputs.dotnet }}' -eq 'true') {
+            $languages.Add('.NET')
+          }
+          else {
+            $optionalPaths.Add(".NET: skipped (no .NET-related file changes detected)")
+          }
+
+          if ('${{ steps.filter.outputs.python }}' -eq 'true') {
+            $languages.Add('Python')
+          }
+          else {
+            $optionalPaths.Add("Python: skipped (no Python-related file changes detected)")
+          }
+
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            $optionalPaths.Clear()
+            $optionalPaths.Add('.NET: enabled (manual dispatch validates optional language path)')
+            $optionalPaths.Add('Python: enabled (manual dispatch validates optional language path)')
+          }
+
+          @(
+            '## Workflow Context'
+            '- Branch: ${{ github.ref_name }}'
+            '- Event: ${{ github.event_name }}'
+            "- Language paths: $($languages -join ', ')"
+            "- Optional path decisions: $($optionalPaths -join '; ')"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+  validate-package-dependency-availability:
+    # Validate package release sources early so missing upstream assets fail PR checks before merge.
+    needs: validate-repo-structure
+    if: >
+      needs.validate-repo-structure.outputs.has_dependencies == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.base.ref == 'main' &&
+      contains(fromJson('["opened","synchronize","reopened"]'), github.event.action)))
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.merge_commit_sha || github.sha }}
+
+      - name: Create dependency repository app token
+        id: dependency_app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DEPENDENCY_APP_ID }}
+          private-key: ${{ secrets.DEPENDENCY_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ needs.validate-repo-structure.outputs.repositories }}
+
+      - name: Validate package dependency release availability
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ steps.dependency_app_token.outputs.token }}
+        run: |
+          $dependencyFile = "pipeline-config/ref/pkg-dependencies.yaml"
+          if (-not (Test-Path $dependencyFile)) {
+            throw "Required package dependency file '$dependencyFile' is missing."
+          }
+
+          if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+            $attempts = 3
+            for ($attempt = 1; $attempt -le $attempts; $attempt += 1) {
+              try {
+                if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+                  Register-PSRepository -Default -ErrorAction Stop
+                }
+
+                Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
+                Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+                Import-Module powershell-yaml -ErrorAction Stop
+                break
+              }
+              catch {
+                if ($attempt -eq $attempts) {
+                  throw
+                }
+
+                Write-Host "powershell-yaml bootstrap attempt $attempt/$attempts failed: $($_.Exception.Message)"
+              }
+            }
+          }
+
+          function Resolve-GitHubReleaseRepositorySlug {
+            param([string]$SourceLocation)
+
+            $uri = [System.Uri]::new($SourceLocation)
+            if ($uri.Host -ne 'github.com') {
+              throw "Unsupported release package source '$SourceLocation'. Expected a GitHub release URL."
+            }
+
+            $segments = @($uri.AbsolutePath.Trim('/').Split('/'))
+            if ($segments.Count -lt 2) {
+              throw "Source location '$SourceLocation' must point to a GitHub repository release page."
+            }
+
+            return "$($segments[0])/$($segments[1])"
+          }
+
+          function Get-HttpStatusCode {
+            param([System.Exception]$Exception)
+
+            if ($null -ne $Exception -and $null -ne $Exception.Response -and $null -ne $Exception.Response.StatusCode) {
+              return [int]$Exception.Response.StatusCode
+            }
+
+            return 0
+          }
+
+          function Get-GitHubRelease {
+            param(
+              [string]$RepositorySlug,
+              [string]$TagName,
+              [string]$Token
+            )
+
+            $headers = @{
+              Accept = 'application/vnd.github+json'
+              'X-GitHub-Api-Version' = '2022-11-28'
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($Token)) {
+              $headers.Authorization = "token $Token"
+            }
+
+            if ([string]::IsNullOrWhiteSpace($TagName) -or $TagName -eq 'latest') {
+              try {
+                return Invoke-RestMethod -Method Get -Headers $headers -Uri "https://api.github.com/repos/$RepositorySlug/releases/latest" -ErrorAction Stop
+              }
+              catch {
+                $statusCode = Get-HttpStatusCode -Exception $_.Exception
+                if ($statusCode -eq 404) {
+                  throw "Package release not available for '$RepositorySlug' (requested: latest). No published release was found, or repository access is unavailable."
+                }
+
+                throw "Failed to resolve latest package release for '$RepositorySlug'. GitHub API status: $statusCode."
+              }
+            }
+
+            $candidateTags = @($TagName)
+            if (-not $TagName.StartsWith('v')) {
+              $candidateTags += "v$TagName"
+            }
+
+            $lastStatusCode = 0
+            foreach ($candidateTag in $candidateTags) {
+              try {
+                return Invoke-RestMethod -Method Get -Headers $headers -Uri "https://api.github.com/repos/$RepositorySlug/releases/tags/$candidateTag" -ErrorAction Stop
+              }
+              catch {
+                $statusCode = Get-HttpStatusCode -Exception $_.Exception
+                if ($statusCode -eq 404) {
+                  $lastStatusCode = $statusCode
+                  continue
+                }
+
+                throw "Failed to resolve package release tag '$candidateTag' for '$RepositorySlug'. GitHub API status: $statusCode."
+              }
+            }
+
+            if ($lastStatusCode -eq 404) {
+              throw "Package release version not available for '$RepositorySlug' (requested: '$TagName')."
+            }
+
+            throw "No GitHub release tag matching '$TagName' was found for '$RepositorySlug'."
+          }
+
+          function Test-ReleasePackageAvailability {
+            param(
+              [string]$RepoSection,
+              [string]$PackageSection,
+              [string]$LogLabel,
+              [hashtable]$DependencyConfig,
+              [string]$Token,
+              [System.Collections.Generic.List[string]]$Issues,
+              [System.Collections.Generic.List[string]]$Successes
+            )
+
+            $repositoryEntries = @()
+            if ($null -ne $DependencyConfig.$RepoSection) {
+              $repositoryEntries = @($DependencyConfig.$RepoSection)
+            }
+
+            $packageEntries = @()
+            if ($null -ne $DependencyConfig.$PackageSection) {
+              $packageEntries = @($DependencyConfig.$PackageSection)
+            }
+
+            if ($packageEntries.Count -eq 0) {
+              Write-Host "No $PackageSection entries found in '$dependencyFile'. Skipping $LogLabel dependency availability check."
+              return
+            }
+
+            if ($repositoryEntries.Count -eq 0) {
+              $Issues.Add("${LogLabel}: No $RepoSection entries found in '$dependencyFile'.")
+              return
+            }
+
+            $repoLookup = @{}
+            foreach ($repo in $repositoryEntries) {
+              if ([string]::IsNullOrWhiteSpace($repo.name) -or [string]::IsNullOrWhiteSpace($repo.sourceLocation)) {
+                $Issues.Add("${LogLabel}: Each $RepoSection entry in '$dependencyFile' must include 'name' and 'sourceLocation'.")
+                continue
+              }
+
+              $repoLookup[$repo.name] = $repo
+            }
+
+            foreach ($package in $packageEntries) {
+              $packageName = $package.name
+              if ([string]::IsNullOrWhiteSpace($packageName)) {
+                $Issues.Add("${LogLabel}: Each $PackageSection entry in '$dependencyFile' must include 'name'.")
+                continue
+              }
+
+              if (-not $repoLookup.ContainsKey($packageName)) {
+                $Issues.Add("${LogLabel}: No matching $RepoSection entry was found for package '$packageName'.")
+                continue
+              }
+
+              $repo = $repoLookup[$packageName]
+              $repoSlug = Resolve-GitHubReleaseRepositorySlug -SourceLocation $repo.sourceLocation
+              $requestedVersion = if ([string]::IsNullOrWhiteSpace($package.version) -or $package.version -eq 'latest') {
+                'latest'
+              }
+              else {
+                [string]$package.version
+              }
+
+              try {
+                $releaseTag = if ($requestedVersion -eq 'latest') { $null } else { $requestedVersion }
+                $release = Get-GitHubRelease -RepositorySlug $repoSlug -TagName $releaseTag -Token $Token
+                $assets = @($release.assets)
+
+                if ($assets.Count -eq 0) {
+                  $Issues.Add("${LogLabel}: Package '$packageName' release '$($release.tag_name)' from '$repoSlug' has no assets.")
+                  continue
+                }
+
+                $Successes.Add("${LogLabel}: Package '$packageName' available from '$repoSlug' (resolved tag '$($release.tag_name)', assets: $($assets.Count)).")
+              }
+              catch {
+                $Issues.Add("${LogLabel}: Package '$packageName' from '$repoSlug' is missing or unavailable (requested: $requestedVersion). $($_.Exception.Message)")
+              }
+            }
+          }
+
+          $ghToken = $env:GH_TOKEN
+
+          $dependencyConfig = Get-Content -Path $dependencyFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+          $issues = New-Object System.Collections.Generic.List[string]
+          $successes = New-Object System.Collections.Generic.List[string]
+
+          Test-ReleasePackageAvailability -RepoSection 'powershellRepositories' -PackageSection 'powershellModules' -LogLabel 'PowerShell' -DependencyConfig $dependencyConfig -Token $ghToken -Issues $issues -Successes $successes
+          Test-ReleasePackageAvailability -RepoSection 'dotnetReleaseRepositories' -PackageSection 'dotnetReleasePackages' -LogLabel '.NET' -DependencyConfig $dependencyConfig -Token $ghToken -Issues $issues -Successes $successes
+          Test-ReleasePackageAvailability -RepoSection 'pythonReleaseRepositories' -PackageSection 'pythonReleasePackages' -LogLabel 'Python' -DependencyConfig $dependencyConfig -Token $ghToken -Issues $issues -Successes $successes
+
+          if ($successes.Count -gt 0) {
+            @('## Dependency availability checks (resolved)') + @($successes) |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+
+          if ($issues.Count -gt 0) {
+            @('## Dependency availability checks (issues found)') + @($issues) |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            throw "Package dependency availability validation failed. One or more configured release packages are missing or unavailable."
+          }
+
+          @(
+            '## Dependency availability checks'
+            '- All configured dependency release packages are available.'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+  lint-and-test:
+    # PowerShell validation path (job id preserved for release gate compatibility).
+    needs:
+      - spell-check
+      - markdownlint
+      - action-version-audit
+      - actionlint
+      - security-scan
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.base.ref == 'main' &&
+      (contains(fromJson('["opened","synchronize","reopened"]'), github.event.action) ||
+      (github.event.action == 'closed' && github.event.pull_request.merged == true)))
+    uses: ./.github/workflows/ci-powershell.yaml
     with:
-      checkout_ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.merge_commit_sha || github.sha }}
-      pkg_dependency_reference_file: pipeline-config/ref/pkg-dependencies.yaml
-      test_dependency_reference_file: pipeline-config/ref/test-dependencies.yaml
-      pipeline_config_file: pipeline-config/ref/pipeline.yaml
-      publish_targets_file: pipeline-config/ref/publish-targets.yaml
-      release_stage_config_file: pipeline-config/ref/release-stages.yaml
-      release_package_exclusions_file: pipeline-config/ref/release-package-exclusions.yaml
-      notify_config_file: pipeline-config/ref/notify.yaml
-      incident_config_file: pipeline-config/ref/incidents.yaml
-      workflow_contract_version: 1.0.0
+      ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.merge_commit_sha || github.sha }}
+      dependency-file: pipeline-config/ref/test-dependencies.yaml
+
+  ci-dotnet:
+    # Run .NET validation when .NET-relevant files changed, or on manual dispatch.
+    needs:
+      - spell-check
+      - markdownlint
+      - action-version-audit
+      - actionlint
+      - security-scan
+      - changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.dotnet == 'true'
+    uses: ./.github/workflows/ci-dotnet.yaml
+    with:
+      ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.merge_commit_sha || github.sha }}
+      dependency-file: pipeline-config/ref/test-dependencies.yaml
+
+  ci-python:
+    # Run Python validation when Python-relevant files changed, or on manual dispatch.
+    needs:
+      - spell-check
+      - markdownlint
+      - action-version-audit
+      - actionlint
+      - security-scan
+      - changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.python == 'true'
+    uses: ./.github/workflows/ci-python.yaml
+    with:
+      ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.merge_commit_sha || github.sha }}
+      dependency-file: pipeline-config/ref/test-dependencies.yaml
+
+  build-and-package:
+    # Only package code when a PR is merged into main.
+    # Optional language jobs may be skipped when unrelated file types were changed.
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main' &&
+      needs.lint-and-test.result == 'success' &&
+      (needs.ci-dotnet.result == 'success' || needs.ci-dotnet.result == 'skipped') &&
+      (needs.ci-python.result == 'success' || needs.ci-python.result == 'skipped')
+    needs:
+      - spell-check
+      - markdownlint
+      - action-version-audit
+      - security-scan
+      - lint-and-test
+      - ci-dotnet
+      - ci-python
+    runs-on: windows-2022
+
+    steps:
+      # Package the merged commit that landed on main.
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      # Ensure Node.js 24 is available for any Node-based tooling in this job.
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v5
+        with:
+          node-version: latest
+
+      # Create output folder for packaged artifact.
+      - name: Create build output directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path out -Force | Out-Null
+
+      # Compress repository contents into a PR-specific archive.
+      - name: Package source
+        shell: pwsh
+        run: |
+          $repoName = "${{ github.event.repository.name }}"
+          if ([string]::IsNullOrWhiteSpace($repoName)) {
+            $repoName = "${{ github.repository }}" -replace '.+/', ''
+          }
+          $packagePath = "out/$repoName-pr-${{ github.event.pull_request.number }}-${{ github.sha }}.zip"
+          $sourceItems = Get-ChildItem -Force | Where-Object { $_.Name -ne 'out' }
+          Compress-Archive -Path $sourceItems -DestinationPath $packagePath -Force
+
+      # Upload packaged archive for downstream use or manual download.
+      - name: Upload build package
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-package-pr-${{ github.event.pull_request.number }}-${{ github.sha }}
+          path: out/${{ github.event.repository.name }}-pr-${{ github.event.pull_request.number }}-${{ github.sha }}.zip
+
+  update-changelog:
+    # Update CHANGELOG.md directly in PR branches targeting main during review.
+    # Bot commits include a skip token to avoid recursive CI runs.
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.base.ref == 'main' &&
+      contains(fromJson('["opened","synchronize","reopened"]'), github.event.action) &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !endsWith(github.actor, '[bot]') &&
+      !startsWith(github.event.pull_request.head.ref, 'automation/changelog-')
+    needs:
+      - validate-repo-structure
+      - spell-check
+      - markdownlint
+      - action-version-audit
+      - security-scan
+      - lint-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout PR head branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: Resolve PR changelog payload
+        id: notes
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+
+            core.setOutput('entry_title', pr.title || `PR #${pr.number}`);
+            core.setOutput('entry_source', `#${pr.number}`);
+            core.setOutput('entry_base', pr.base.ref);
+            core.setOutput('entry_head', pr.head.ref);
+            core.setOutput('entry_body', pr.body ? pr.body.trim() : '');
+            core.setOutput('pr_number', String(pr.number));
+
+      - name: Ensure changelog file exists
+        run: |
+          if [ ! -f CHANGELOG.md ]; then
+            printf '%s\n\n%s\n' \
+              '# Changelog' \
+              'All notable changes to this project will be documented in this file.' \
+              > CHANGELOG.md
+          fi
+
+      - name: Update changelog content
+        env:
+          ENTRY_PR_NUMBER: ${{ steps.notes.outputs.pr_number }}
+          ENTRY_TITLE: ${{ steps.notes.outputs.entry_title }}
+          ENTRY_SOURCE: ${{ steps.notes.outputs.entry_source }}
+          ENTRY_BASE: ${{ steps.notes.outputs.entry_base }}
+          ENTRY_HEAD: ${{ steps.notes.outputs.entry_head }}
+          ENTRY_BODY: ${{ steps.notes.outputs.entry_body }}
+        run: |
+          python - <<'PY'
+          import re
+          import os
+          from pathlib import Path
+
+          pr_number = int(os.environ['ENTRY_PR_NUMBER'].strip())
+          title = os.environ['ENTRY_TITLE'].strip()
+          source_pr = os.environ['ENTRY_SOURCE'].strip() or f'#{pr_number}'
+          base_branch = os.environ['ENTRY_BASE'].strip() or 'main'
+          head_branch = os.environ['ENTRY_HEAD'].strip() or 'unknown'
+          body = os.environ['ENTRY_BODY'].strip()
+
+          def normalize_details(raw: str):
+            details = []
+            seen = set()
+            for raw_line in raw.splitlines():
+              line = raw_line.strip()
+              if not line:
+                continue
+              if line.startswith('- ') or line.startswith('* '):
+                line = line[2:].strip()
+              if line.startswith('[ ] '):
+                line = line[4:].strip()
+              elif line.startswith('[x] ') or line.startswith('[X] '):
+                line = line[4:].strip()
+              if not line:
+                continue
+              if line.startswith('#'):
+                continue
+              key = line.lower()
+              if key in seen:
+                continue
+              seen.add(key)
+              details.append(line)
+            return details
+
+          def parse_structured_entries(lines):
+            starts = []
+            for idx, line in enumerate(lines):
+              match = re.match(r'^### PR #(\d+) - (.+)$', line)
+              if match:
+                starts.append((idx, int(match.group(1)), match.group(2).strip()))
+
+            sections = {}
+            for pos, (start_idx, num, parsed_title) in enumerate(starts):
+              end_idx = starts[pos + 1][0] if pos + 1 < len(starts) else len(lines)
+              section = lines[start_idx:end_idx]
+              data = {
+                'title': parsed_title,
+                'source': f'#{num}',
+                'base': 'main',
+                'head': 'unknown',
+                'date': '',
+                'details': [],
+              }
+
+              in_details = False
+              for row in section[1:]:
+                stripped = row.strip()
+                if not stripped:
+                  continue
+                if stripped.startswith('- Source PR:'):
+                  data['source'] = stripped.split(':', 1)[1].strip()
+                  in_details = False
+                elif stripped.startswith('- Base branch:'):
+                  data['base'] = stripped.split(':', 1)[1].strip()
+                  in_details = False
+                elif stripped.startswith('- Head branch:'):
+                  data['head'] = stripped.split(':', 1)[1].strip()
+                  in_details = False
+                elif stripped.startswith('- Date:'):
+                  data['date'] = stripped.split(':', 1)[1].strip()
+                  in_details = False
+                elif stripped == '- Details:':
+                  in_details = True
+                elif in_details and (stripped.startswith('- ') or stripped.startswith('* ')):
+                  detail = stripped[2:].strip()
+                  if detail and (not detail.startswith('#')) and detail not in data['details']:
+                    data['details'].append(detail)
+
+              sections[num] = data
+
+            return sections
+
+          def extract_legacy_details(lines, target_pr):
+            start = -1
+            end = len(lines)
+            legacy_title = ''
+
+            for i, line in enumerate(lines):
+              match = re.match(r'^## PR #(\d+):\s*(.+)$', line)
+              if match and int(match.group(1)) == target_pr:
+                start = i
+                legacy_title = match.group(2).strip()
+                break
+
+            if start < 0:
+              return '', [], lines
+
+            for j in range(start + 1, len(lines)):
+              if re.match(r'^## PR #\d+:', lines[j]) or lines[j].strip() == '## Pull Request History':
+                end = j
+                break
+
+            legacy_block = lines[start:end]
+            details = []
+            for row in legacy_block[1:]:
+              stripped = row.strip()
+              if not stripped:
+                continue
+              if stripped in {'### Summary', '## Summary', '## Commits', '## Validation'}:
+                continue
+              if stripped.startswith('Source PR:') or stripped.startswith('Base branch:') or stripped.startswith('Head branch:'):
+                continue
+              if stripped.startswith('- '):
+                candidate = stripped[2:].strip()
+                if candidate and (not candidate.startswith('#')):
+                  details.append(candidate)
+              elif stripped.startswith('* '):
+                candidate = stripped[2:].strip()
+                if candidate and (not candidate.startswith('#')):
+                  details.append(candidate)
+
+            pruned_lines = lines[:start] + lines[end:]
+            return legacy_title, details, pruned_lines
+
+          changelog_path = Path('CHANGELOG.md')
+          text = changelog_path.read_text(encoding='utf-8') if changelog_path.exists() else ''
+          lines = text.splitlines()
+
+          if not lines:
+            lines = [
+              '# Changelog',
+              '',
+              'All notable changes to this project are documented in this file.',
+              '',
+              '## Pull Request History',
+              '',
+              'Deduplicated historical PR records, newest first, with key details retained.',
+              '',
+            ]
+
+          if not any(line.strip() == '## Pull Request History' for line in lines):
+            if lines and lines[-1].strip() != '':
+              lines.append('')
+            lines.extend([
+              '## Pull Request History',
+              '',
+              'Deduplicated historical PR records, newest first, with key details retained.',
+              '',
+            ])
+
+          legacy_title, legacy_details, lines = extract_legacy_details(lines, pr_number)
+          sections = parse_structured_entries(lines)
+
+          existing = sections.get(pr_number, {
+            'title': title,
+            'source': source_pr,
+            'base': base_branch,
+            'head': head_branch,
+            'date': '',
+            'details': [],
+          })
+
+          merged_details = []
+          seen_details = set()
+          normalized_legacy_details = normalize_details('\n'.join(legacy_details))
+          normalized_existing_details = normalize_details('\n'.join(existing.get('details', [])))
+          for detail in normalize_details(body) + normalized_legacy_details + normalized_existing_details:
+            detail = detail.strip()
+            if not detail:
+              continue
+            key = detail.lower()
+            if key in seen_details:
+              continue
+            seen_details.add(key)
+            merged_details.append(detail)
+
+          if not merged_details:
+            merged_details = ['No PR description provided.']
+
+          existing['title'] = title or legacy_title or existing.get('title') or f'PR #{pr_number}'
+          existing['source'] = source_pr
+          existing['base'] = base_branch
+          existing['head'] = head_branch
+          existing['details'] = merged_details
+          sections[pr_number] = existing
+
+          header_lines = []
+          for i, line in enumerate(lines):
+            if re.match(r'^### PR #(\d+) - ', line):
+              header_lines = lines[:i]
+              break
+          if not header_lines:
+            header_lines = lines
+
+          output = [line.rstrip() for line in header_lines]
+          if output and output[-1] != '':
+            output.append('')
+
+          for num in sorted(sections.keys(), reverse=True):
+            entry = sections[num]
+            output.append(f"### PR #{num} - {entry['title']}")
+            output.append('')
+            output.append(f"- Source PR: {entry['source']}")
+            output.append(f"- Base branch: {entry['base']}")
+            output.append(f"- Head branch: {entry['head']}")
+            if entry.get('date'):
+              output.append(f"- Date: {entry['date']}")
+            output.append('- Details:')
+            for detail in entry.get('details', []):
+              output.append(f"  - {detail}")
+            output.append('')
+
+          new_text = '\n'.join(output).rstrip() + '\n'
+          if new_text == text:
+              print('No changelog content changes detected.')
+              raise SystemExit(0)
+
+          changelog_path.write_text(new_text, encoding='utf-8')
+          print(f"Updated structured changelog entry for PR #{pr_number}.")
+          PY
+
+      - name: Commit changelog update to PR branch
+        env:
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ steps.notes.outputs.pr_number }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add CHANGELOG.md
+
+          if git diff --cached --quiet; then
+            echo "No changelog changes detected for PR #${PR_NUMBER}; skipping commit."
+            exit 0
+          fi
+
+          git commit -m "docs(changelog): update for PR #${PR_NUMBER} [skip ci]"
+          git push origin "HEAD:${PR_BRANCH}"
+
+      - name: Summarize changelog update
+        run: |
+          {
+            echo "## Changelog Update"
+            echo "- Source PR: #${{ steps.notes.outputs.pr_number }}"
+            echo "- Target branch: ${{ github.event.pull_request.base.ref }}"
+            echo "- Updated file: CHANGELOG.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify:
+    # Send Microsoft Teams/email notifications for workflow failure or cancellation.
+    if: ${{ always() }}
+    needs:
+      - validate-repo-structure
+      - spell-check
+      - markdownlint
+      - action-version-audit
+      - security-scan
+      - changes
+      - validate-package-dependency-availability
+      - lint-and-test
+      - ci-dotnet
+      - ci-python
+      - build-and-package
+      - update-changelog
+    uses: ./.github/workflows/notify.yaml
+    with:
+      source_workflow: ci-core
+      status: ${{ contains(join(needs.*.result, ','), 'failure') && 'failure' || (contains(join(needs.*.result, ','), 'cancelled') && 'cancelled' || 'success') }}
+      ref: ${{ github.ref_name }}
+      run_url: ${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+      summary: ${{ toJson(needs) }}
+      notify_on_success: false
     secrets: inherit
+
+  incident:
+    # Open or update deduplicated pipeline incident issues for failures/cancellations.
+    if: ${{ always() && (contains(join(needs.*.result, ','), 'failure') || contains(join(needs.*.result, ','), 'cancelled')) }}
+    needs:
+      - validate-repo-structure
+      - spell-check
+      - markdownlint
+      - action-version-audit
+      - security-scan
+      - changes
+      - validate-package-dependency-availability
+      - lint-and-test
+      - ci-dotnet
+      - ci-python
+      - build-and-package
+      - update-changelog
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/incident.yaml
+    with:
+      source_workflow: ci-core
+      status: ${{ contains(join(needs.*.result, ','), 'failure') && 'failure' || (contains(join(needs.*.result, ','), 'cancelled') && 'cancelled' || 'success') }}
+      ref: ${{ github.ref_name }}
+      run_url: ${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+      summary: ${{ toJson(needs) }}
+
+  workflow-outcome-summary:
+    # Emit a final matrix of job outcomes, including optional/skipped paths.
+    if: ${{ always() }}
+    needs:
+      - validate-repo-structure
+      - spell-check
+      - markdownlint
+      - action-version-audit
+      - security-scan
+      - changes
+      - validate-package-dependency-availability
+      - lint-and-test
+      - ci-dotnet
+      - ci-python
+      - build-and-package
+      - update-changelog
+      - notify
+      - incident
+    runs-on: windows-2022
+    steps:
+      - name: Summarize final workflow outcomes
+        shell: pwsh
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          $needs = $env:NEEDS_JSON | ConvertFrom-Json -AsHashtable
+
+          @(
+            '## Final Outcome Matrix'
+            '| Job | Result |'
+            '| --- | --- |'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          foreach ($jobName in ($needs.Keys | Sort-Object)) {
+            $result = [string]$needs[$jobName].result
+            if ([string]::IsNullOrWhiteSpace($result)) {
+              $result = 'unknown'
+            }
+
+            "| $jobName | $result |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+
+

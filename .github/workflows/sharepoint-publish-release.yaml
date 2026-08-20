@@ -3,17 +3,326 @@ name: Publish to SharePoint (Release)
 on:
   release:
     types: [published]
+  workflow_call:
+    inputs:
+      release-tag:
+        required: true
+        type: string
+        description: Release tag to publish from
+      release-stage:
+        required: true
+        type: string
+        description: Release stage (alpha/beta/rc/production)
+    secrets:
+      SHAREPOINT_RELEASE_CREDENTIALS_SAND:
+        required: false
+        description: SharePoint sandbox credentials (JSON)
+      SHAREPOINT_RELEASE_CREDENTIALS_PROD:
+        required: false
+        description: SharePoint production credentials (JSON)
 
 permissions:
   contents: read
 
+env:
+  PUBLISH_TARGETS_FILE: pipeline-config/ref/publish-targets.yaml
+
 jobs:
   publish-sharepoint:
-    if: ${{ vars.PIPELINE_ENABLED == 'true' }}
-    uses: Semperis-Community/.github/.github/workflows/sharepoint-publish-reusable.yaml@v1.0.0
-    with:
-      release-tag: ${{ github.event.release.tag_name }}
-      release-stage: ${{ contains(github.event.release.tag_name, '-alpha') && 'alpha' || contains(github.event.release.tag_name, '-beta') && 'beta' || contains(github.event.release.tag_name, '-rc') && 'rc' || 'production' }}
-    secrets:
-      SHAREPOINT_RELEASE_CREDENTIALS_SAND: ${{ secrets.SHAREPOINT_RELEASE_CREDENTIALS_SAND }}
-      SHAREPOINT_RELEASE_CREDENTIALS_PROD: ${{ secrets.SHAREPOINT_RELEASE_CREDENTIALS_PROD }}
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Resolve release inputs
+        # Populates RELEASE_TAG and RELEASE_STAGE into GITHUB_ENV for all subsequent steps
+        shell: pwsh
+        env:
+          TAG_INPUT: ${{ inputs['release-tag'] }}
+          STAGE_INPUT: ${{ inputs['release-stage'] }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          $tag = if (-not [string]::IsNullOrWhiteSpace($env:TAG_INPUT)) { $env:TAG_INPUT } else { $env:EVENT_TAG }
+          if ([string]::IsNullOrWhiteSpace($tag)) { throw 'Could not resolve release tag from inputs or event context.' }
+
+          $stage = $env:STAGE_INPUT
+          if ([string]::IsNullOrWhiteSpace($stage)) {
+            if ($tag -match '-alpha') { $stage = 'alpha' }
+            elseif ($tag -match '-beta') { $stage = 'beta' }
+            elseif ($tag -match '-rc') { $stage = 'rc' }
+            else { $stage = 'production' }
+          }
+
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RELEASE_STAGE=$stage" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Release tag: $tag"
+          Write-Host "Release stage: $stage"
+
+      - name: Evaluate SharePoint publishing toggle
+        id: sharepoint-enabled
+        shell: pwsh
+        run: |
+          $dependencyFile = "${{ env.PUBLISH_TARGETS_FILE }}"
+          $enabled = $true
+
+          if (-not (Test-Path $dependencyFile)) {
+            Write-Host "Publish targets file '$dependencyFile' not found. SharePoint publish will be skipped."
+            $enabled = $false
+          }
+          else {
+            $lines = Get-Content -Path $dependencyFile
+            $baseIndent = $null
+            $inSharePointBlock = $false
+
+            foreach ($line in $lines) {
+              if (-not $inSharePointBlock) {
+                if ($line -match '^(?<indent>\s*)sharePointPublishing\s*:\s*(?:#.*)?$') {
+                  $baseIndent = $Matches['indent'].Length
+                  $inSharePointBlock = $true
+                }
+                continue
+              }
+
+              if ($line -match '^\s*(#.*)?$') { continue }
+
+              $indent = ([regex]::Match($line, '^\s*').Value).Length
+              if ($indent -le $baseIndent) { break }
+
+              if ($line -match '^\s*enabled\s*:\s*(?<value>[^#]+)') {
+                $normalizedEnabled = $Matches['value'].Trim().ToLowerInvariant()
+                if ($normalizedEnabled -in @('false', '0', 'no', 'off')) { $enabled = $false }
+                elseif ($normalizedEnabled -in @('true', '1', 'yes', 'on')) { $enabled = $true }
+                else { throw "Invalid sharePointPublishing.enabled value '$($Matches['value'].Trim())'. Use true or false." }
+                break
+              }
+            }
+          }
+
+          "enabled=$($enabled.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "SharePoint publish enabled: $enabled"
+
+      - name: Download release assets
+        if: steps['sharepoint-enabled'].outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+
+          # gh release download pulls only uploaded assets — auto-generated source archives are not in the assets API
+          & gh release download $env:RELEASE_TAG --pattern '*.zip' --dir out --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::gh release download exited $LASTEXITCODE for tag '$env:RELEASE_TAG' — assuming no ZIP assets."
+            $global:LASTEXITCODE = 0
+          }
+
+          # Belt-and-suspenders: remove any source code archive that slipped through
+          $sourcePattern = "^($([regex]::Escape($env:RELEASE_TAG))|[Ss]ource[_. -]?[Cc]ode)\.zip$"
+          Get-ChildItem -Path out -Filter '*.zip' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $sourcePattern } |
+            ForEach-Object {
+              Write-Host "Excluding source archive: $($_.Name)"
+              Remove-Item $_.FullName -Force
+            }
+
+          $publishable = @(Get-ChildItem -Path out -Filter '*.zip' -Recurse -ErrorAction SilentlyContinue)
+          if ($publishable.Count -eq 0) {
+            "## SharePoint publish skipped" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            "- Release '$env:RELEASE_TAG' contains no publishable ZIP assets." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            Write-Host "No publishable ZIP files found in release '$env:RELEASE_TAG'. Nothing to publish."
+          } else {
+            Write-Host "Found $($publishable.Count) publishable ZIP file(s) in release '$env:RELEASE_TAG'."
+          }
+
+      - name: Trust PSGallery for module installs
+        if: steps['sharepoint-enabled'].outputs.enabled == 'true'
+        shell: pwsh
+        run: Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+
+      - name: Publish release assets to SharePoint targets
+        if: steps['sharepoint-enabled'].outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          SHAREPOINT_RELEASE_CREDENTIALS_SAND: ${{ secrets.SHAREPOINT_RELEASE_CREDENTIALS_SAND }}
+          SHAREPOINT_RELEASE_CREDENTIALS_PROD: ${{ secrets.SHAREPOINT_RELEASE_CREDENTIALS_PROD }}
+        run: |
+          $dependencyFile = "${{ env.PUBLISH_TARGETS_FILE }}"
+          if (-not (Test-Path $dependencyFile)) {
+            Write-Host "Publish targets file '$dependencyFile' not found. Skipping SharePoint publish."
+            exit 0
+          }
+
+          if (-not (Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue)) {
+            if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+              Register-PSRepository -Default -ErrorAction Stop
+            }
+            Install-Module -Name powershell-yaml -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            Import-Module powershell-yaml -ErrorAction Stop
+          }
+
+          if (-not (Get-Module -ListAvailable -Name PnP.PowerShell)) {
+            Install-Module -Name PnP.PowerShell -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+          }
+          Import-Module PnP.PowerShell -ErrorAction Stop
+          if (-not (Get-Command -Name Resolve-PnPFolder -ErrorAction SilentlyContinue)) {
+            throw "PnP.PowerShell does not expose Resolve-PnPFolder in this environment."
+          }
+
+          function Get-SharePointCredentials {
+            param([string]$SecretValue)
+            if ([string]::IsNullOrWhiteSpace($SecretValue)) { return $null }
+            try { return ($SecretValue | ConvertFrom-Json -ErrorAction Stop) }
+            catch { throw "SharePoint credential secret must be JSON. Expected fields: authType (optional), and either certificate fields (clientId, tenantId plus certificatePath/certificatePassword or certificateBase64/certificatePassword) or accessToken." }
+          }
+
+          function Connect-SharePointTarget {
+            param([string]$SiteUrl, [psobject]$CredentialObject)
+            if ($null -eq $CredentialObject) { throw "Missing SharePoint credential payload." }
+            $authType = [string]$CredentialObject.authType
+            if ([string]::IsNullOrWhiteSpace($authType)) { $authType = 'certificate' }
+            switch ($authType.Trim().ToLowerInvariant()) {
+              'accesstoken' {
+                $t = [string]$CredentialObject.accessToken
+                if ([string]::IsNullOrWhiteSpace($t)) { throw "SharePoint credentials authType 'accessToken' requires 'accessToken'." }
+                Connect-PnPOnline -Url $SiteUrl -AccessToken $t -ErrorAction Stop; break
+              }
+              'graphaccesstoken' {
+                $t = [string]$CredentialObject.accessToken
+                if ([string]::IsNullOrWhiteSpace($t)) { throw "SharePoint credentials authType 'graphAccessToken' requires 'accessToken'." }
+                Connect-PnPOnline -Url $SiteUrl -AccessToken $t -ErrorAction Stop; break
+              }
+              'certificate' {
+                $id = [string]$CredentialObject.clientId
+                $tenantId = [string]$CredentialObject.tenantId
+                $certificatePath = [string]$CredentialObject.certificatePath
+                $certificatePassword = [string]$CredentialObject.certificatePassword
+                $certificateBase64 = [string]$CredentialObject.certificateBase64
+                if ([string]::IsNullOrWhiteSpace($id) -or [string]::IsNullOrWhiteSpace($tenantId)) { throw "SharePoint credentials authType 'certificate' requires clientId and tenantId." }
+
+                if (-not [string]::IsNullOrWhiteSpace($certificatePath)) {
+                  if ([string]::IsNullOrWhiteSpace($certificatePassword)) { throw "SharePoint credentials authType 'certificate' using certificatePath requires certificatePassword." }
+                  $securePassword = ConvertTo-SecureString -String $certificatePassword -AsPlainText -Force
+                  Connect-PnPOnline -Url $SiteUrl -ClientId $id -Tenant $tenantId -CertificatePath $certificatePath -CertificatePassword $securePassword -ErrorAction Stop; break
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace($certificateBase64)) {
+                  if ([string]::IsNullOrWhiteSpace($certificatePassword)) { throw "SharePoint credentials authType 'certificate' using certificateBase64 requires certificatePassword." }
+                  $securePassword = ConvertTo-SecureString -String $certificatePassword -AsPlainText -Force
+                  Connect-PnPOnline -Url $SiteUrl -ClientId $id -Tenant $tenantId -CertificateBase64Encoded $certificateBase64 -CertificatePassword $securePassword -ErrorAction Stop; break
+                }
+
+                throw "SharePoint credentials authType 'certificate' requires either certificatePath or certificateBase64."
+              }
+              default { throw "Unsupported SharePoint authType '$authType'. Supported values: certificate, accessToken, graphAccessToken." }
+            }
+          }
+
+          $dependencyConfig = Get-Content -Path $dependencyFile -Raw | ConvertFrom-Yaml -ErrorAction Stop
+          $sharePointEnabled = $true
+          if ($null -ne $dependencyConfig.sharePointPublishing -and $null -ne $dependencyConfig.sharePointPublishing.enabled) {
+            $raw = $dependencyConfig.sharePointPublishing.enabled
+            if ($raw -is [bool]) { $sharePointEnabled = [bool]$raw }
+            else {
+              $n = ([string]$raw).Trim().ToLowerInvariant()
+              if ($n -in @('true','1','yes','on')) { $sharePointEnabled = $true }
+              elseif ($n -in @('false','0','no','off')) { $sharePointEnabled = $false }
+              else { throw "Invalid sharePointPublishing.enabled value '$raw'. Use true or false." }
+            }
+          }
+          if (-not $sharePointEnabled) { Write-Host "sharePointPublishing.enabled is false. Skipping SharePoint publish."; exit 0 }
+
+          $publishTargets = @()
+          if ($null -ne $dependencyConfig.sharePointTargets) { $publishTargets = @($dependencyConfig.sharePointTargets) }
+          if ($publishTargets.Count -eq 0) { Write-Host "No sharePointTargets configured. Skipping SharePoint publish."; exit 0 }
+
+          $releaseFiles = @(Get-ChildItem -Path out -Recurse -File -ErrorAction SilentlyContinue)
+          if ($releaseFiles.Count -eq 0) { Write-Host "No release assets found in out/. Skipping SharePoint publish."; exit 0 }
+
+          $outRoot = (Resolve-Path -Path out).Path
+          $targetResults = New-Object System.Collections.Generic.List[string]
+          $failedTargets = New-Object System.Collections.Generic.List[string]
+          $repoFolderName = "${{ github.event.repository.name }}"
+          if ([string]::IsNullOrWhiteSpace($repoFolderName)) { $repoFolderName = "${{ github.repository }}" -replace '.+/', '' }
+          $repoFolderName = ($repoFolderName -replace '[^A-Za-z0-9._-]', '-').Trim('-')
+          if ([string]::IsNullOrWhiteSpace($repoFolderName)) { $repoFolderName = 'repository' }
+
+          foreach ($target in $publishTargets) {
+            $targetName = [string]$target.name
+            if ($null -ne $target.enabled -and "$($target.enabled)".Trim().ToLowerInvariant() -in @('false','0','no','off')) { $targetResults.Add("- SharePoint target '$targetName': skipped (disabled)."); continue }
+            $siteUrl = [string]$target.siteUrl
+            $documentLibrary = [string]$target.documentLibrary
+            $folderPath = [string]$target.folderPath
+            $secretName = [string]$target.secretEnvVar
+            if ([string]::IsNullOrWhiteSpace($siteUrl) -or [string]::IsNullOrWhiteSpace($documentLibrary) -or [string]::IsNullOrWhiteSpace($secretName)) {
+              Write-Host "::warning::SharePoint target '$targetName' is missing required fields (siteUrl, documentLibrary, secretEnvVar). Skipping."
+              $targetResults.Add("- SharePoint target '$targetName': skipped (missing required target configuration)."); continue
+            }
+            $secretValue = [System.Environment]::GetEnvironmentVariable($secretName)
+            if ([string]::IsNullOrWhiteSpace($secretValue)) {
+              Write-Host "::warning::Secret '$secretName' is not set. Skipping SharePoint publish to '$targetName'."
+              $targetResults.Add("- SharePoint target '$targetName': skipped (missing configured secret '$secretName')."); continue
+            }
+
+            $siteRelativeBase = $documentLibrary.Trim('/')
+            if (-not [string]::IsNullOrWhiteSpace($folderPath)) {
+              $trimmedFolderPath = $folderPath.Trim('/')
+              if (-not [string]::IsNullOrWhiteSpace($trimmedFolderPath)) { $siteRelativeBase = "$siteRelativeBase/$trimmedFolderPath" }
+            }
+            $siteRelativeBase = "$siteRelativeBase/$repoFolderName/$env:RELEASE_STAGE"
+
+            Write-Host "Publishing $($releaseFiles.Count) release asset(s) to SharePoint target '$targetName'..."
+            try {
+              $credentials = Get-SharePointCredentials -SecretValue $secretValue
+              Connect-SharePointTarget -SiteUrl $siteUrl -CredentialObject $credentials
+              foreach ($file in $releaseFiles) {
+                $relativePath = [System.IO.Path]::GetRelativePath($outRoot, $file.FullName) -replace '\\', '/'
+                $relativeDirectory = [System.IO.Path]::GetDirectoryName($relativePath)
+                $destinationFolder = $siteRelativeBase
+                if (-not [string]::IsNullOrWhiteSpace($relativeDirectory)) {
+                  $destinationFolder = "$destinationFolder/$($relativeDirectory.Trim('/') -replace '\\', '/')"
+                }
+                Resolve-PnPFolder -SiteRelativePath $destinationFolder -ErrorAction Stop | Out-Null
+                Add-PnPFile -Path $file.FullName -Folder $destinationFolder -ErrorAction Stop | Out-Null
+              }
+              $targetResults.Add("- SharePoint target '$targetName': published ($($releaseFiles.Count) files).")
+            }
+            catch {
+              Write-Host "::warning::SharePoint publish failed for '$targetName'. $($_.Exception.Message)"
+              $targetResults.Add("- SharePoint target '$targetName': failed ($($_.Exception.Message)).")
+              $failedTargets.Add($targetName)
+            }
+            finally { Disconnect-PnPOnline -ErrorAction SilentlyContinue }
+          }
+
+          if ($failedTargets.Count -gt 0) { throw ("SharePoint publish failed for target(s): " + ($failedTargets -join ', ')) }
+
+          if ($targetResults.Count -gt 0) {
+            @(
+              "### SharePoint publish results"
+              "- Release tag: $env:RELEASE_TAG"
+              $targetResults
+            ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+
+      - name: Summarize failure
+        if: failure()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          @(
+            '## SharePoint publish failed'
+            "- Release tag: $env:RELEASE_TAG"
+            "- Release stage: $env:RELEASE_STAGE"
+            "- Workflow run: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            "- Triggered by: $env:GITHUB_EVENT_NAME"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+          # Surface the most recent warning annotations from this run for quick triage
+          $annotations = gh api "repos/$env:GITHUB_REPOSITORY/check-runs" `
+            --jq '.check_runs[] | select(.name == env.GITHUB_JOB) | .output.annotations_url' 2>$null
+          if (-not [string]::IsNullOrWhiteSpace($annotations)) {
+            "- Annotations: $annotations" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+

@@ -1,0 +1,53 @@
+name: Markdown Lint
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: markdownlint-manual-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  markdownlint:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: latest
+
+      - name: Run markdownlint
+        shell: pwsh
+        run: |
+          $markdownlintArgs = @(
+            "--yes"
+            "markdownlint-cli2"
+            "README.md"
+            "docs/**/*.md"
+          )
+
+          $hadIssues = $false
+
+          try {
+            & npx @markdownlintArgs
+            if ($LASTEXITCODE -ne 0) {
+              $hadIssues = $true
+            }
+          }
+          catch {
+            $hadIssues = $true
+            Write-Warning "markdownlint reported issues in advisory mode. $($_.Exception.Message)"
+          }
+
+          if ($hadIssues) {
+            Write-Host "::warning::markdownlint found issues (advisory mode). Review step output."
+          }
+
+          exit 0
